@@ -1,18 +1,19 @@
-name: Market Intelligence Scan
+name: Market Intelligence Scan (GitHub Engine)
 
 on:
-  # SCHEDULE 1: Every 15 minutes during the day (6:30 AM to 5:15 PM IST)
-  # GitHub uses UTC. IST is UTC + 5:30.
-  # 1:00 UTC to 11:45 UTC covers this window Mon-Fri.
+  # CRON SCHEDULE (All times converted from IST to UTC)
+  # IST = UTC + 5:30 | Runs Monday through Friday (1-5)
   schedule:
-    - cron: '*/15 1-11 * * 1-5'
+    # 1. 06:00 AM to 08:00 AM IST -> 00:30 and 01:30 UTC (Every hour)
+    - cron: '30 0-1 * * 1-5'
 
-    # SCHEDULE 2: Every 1 hour in the evening (6:00 PM to 11:00 PM IST)
-    # Runs at the bottom of the hour in UTC (e.g., 12:30 UTC = 6:00 PM IST)
-    # Covers 12:30 UTC to 17:30 UTC Mon-Fri.
-    - cron: '30 12-17 * * 1-5'
+    # 2. 08:00 AM to 04:00 PM (16:00) IST -> 02:30 to 10:30 UTC (Every 30 mins)
+    - cron: '30,0 2-10 * * 1-5'
 
-  # MANUAL TRIGGER: Allows you to run it via the GitHub website or Mobile App
+    # 3. 04:00 PM (16:00) to 10:00 PM (22:00) IST -> 10:30 to 16:30 UTC (Every hour)
+    - cron: '30 10-16 * * 1-5'
+
+  # MANUAL TRIGGER: Allows you to run it manually via GitHub website or app
   workflow_dispatch:
     inputs:
       ignore_cache:
@@ -25,36 +26,50 @@ jobs:
   run-screen:
     runs-on: ubuntu-latest
     steps:
-      # 1. Pull your code from the repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Setup Python environment
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # 3. Install dependencies from requirements.txt
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. Run the Engine with Secure Environment Variables
-      - name: Execute Scan Engine
+      # Ollama & Qwen 2.5 7B Caching Layer for Sieve 1.5
+      - name: Cache Ollama Models
+        id: cache-ollama
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-qwen2.5-7b-${{ runner.os }}
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama Server in Background
+        run: ollama serve &
+
+      - name: Pull Qwen 2.5 7B Model (Instant load from cache if available)
+        run: |
+          sleep 3
+          ollama pull qwen2.5:7b
+
+      - name: Execute GitHub Screening Engine
         env:
-          # Securely injects keys from GitHub Secrets
           GEMINI_API_KEY_FREE: ${{ secrets.GEMINI_API_KEY_FREE }}
           GEMINI_API_KEY_PAID: ${{ secrets.GEMINI_API_KEY_PAID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-
-          # Injects configuration settings (Defaults to true/false if missing)
-          ALERT_ON_SINGLE_MODEL_IGNORE: ${{ vars.ALERT_ON_SINGLE_MODEL_IGNORE || 'true' }}
+          ALERT_ON_SINGLE_MODEL_IGNORE: ${{ vars.ALERT_ON_SINGLE_MODEL_IGNORE || 'false' }}
           IGNORE_CACHE: ${{ github.event.inputs.ignore_cache || 'false' }}
+          OLLAMA_MODEL: 'qwen2.5:7b'
+          USE_LOCAL_EXTRACTOR: 'true'
         run: |
-          python engine.py
+          python engine_github.py
