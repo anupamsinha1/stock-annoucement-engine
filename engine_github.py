@@ -107,7 +107,7 @@ NSE_HEADERS = {
 # 60   = Sends Sieve 60 results only (Passes and early exits)
 # 1000 = Production Mode: Sends ONLY fully passed Sieve 60 filings (Score >= 6)
 # ---------------------------------------------------------------------------
-VERBOSITY_LEVEL = float(os.getenv("VERBOSITY_LEVEL", "1000.0"))
+VERBOSITY_LEVEL = float(os.getenv("VERBOSITY_LEVEL", "40.0"))
 
 DEFAULT_CHUNK_SIZE = 50
 DEFAULT_YOUTUBE_CHANNEL_ID = "UCb5hMTAFjG5j79V6nL3_YCQ"
@@ -162,7 +162,7 @@ def get_db_connection():
     try:
         return psycopg2.connect(SUPABASE_URL)
     except Exception as e:
-        print(f"[Database Error] Connection failed: {e}")
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Database Error] Connection failed: {e}")
         return None
 
 def filter_unprocessed_announcements(filings):
@@ -190,10 +190,10 @@ def filter_unprocessed_announcements(filings):
 
         # Keep only the items that were NOT found in the database
         filtered = [item for item in filings if item['id'] not in existing]
-        print(f" [Cache] Filtered out {len(filings) - len(filtered)} already processed filings.")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Cache] Filtered out {len(filings) - len(filtered)} already processed filings.")
         return filtered
     except Exception as e:
-        print(f"[Database Error] Deduplication query failed: {e}")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Database Error] Deduplication query failed: {e}")
         return filings
 
 def group_filings_by_company(filings):
@@ -234,7 +234,7 @@ def log_announcements_batch(decisions_list):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[Database Error] Batch cache insertion failed: {e}")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Database Error] Batch cache insertion failed: {e}")
 
 def log_permanent_ledger(item, market_data):
     """[STATE UPDATE] Saves the massive, deep-dive AI analysis into our permanent historical tracker."""
@@ -268,7 +268,7 @@ def log_permanent_ledger(item, market_data):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[Database Error] Comprehensive ledger logging failed: {e}")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Database Error] Comprehensive ledger logging failed: {e}")
 
 # ---------------------------------------------------------------------------
 # 3. METRICS & EXTRACTION ROUTER
@@ -283,7 +283,7 @@ def fetch_market_metrics(scrip_code, exchange):
         return default_payload
 
     try:
-        print(f" [Metrics] Fetching market data for {exchange}:{scrip_code}...")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Metrics] Fetching market data for {exchange}:{scrip_code}...")
         ticker = f"{scrip_code}.NS" if exchange == "NSE" else f"{scrip_code}.BO"
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1y")
@@ -316,7 +316,7 @@ def fetch_market_metrics(scrip_code, exchange):
                 # If price is at the absolute day's high AND up more than 4.5%, it's almost certainly locked in a circuit
                 if current_price >= (today_high * 0.998) and pct_change >= 0.045:
                     is_uc = True
-                    print(f" [Metrics] UPPER CIRCUIT LOCK DETECTED for {scrip_code}!")
+                    print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Metrics] UPPER CIRCUIT LOCK DETECTED for {scrip_code}!")
 
         return {
             "price": current_price, "vol_multiple": vol_multiple,
@@ -324,14 +324,14 @@ def fetch_market_metrics(scrip_code, exchange):
             "dist_52w_high": dist_52w_high, "market_cap_cr": market_cap_cr, "is_upper_circuit": is_uc
         }
     except Exception as e:
-        print(f" [Metrics Error] Failed to fetch data for {scrip_code}: {e}")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Metrics Error] Failed to fetch data for {scrip_code}: {e}")
         return default_payload
 
 def fetch_valuepickr_sentiment(company_name):
     """[EXTERNAL API] Scrapes the ValuePickr forum to see if retailers are discussing this stock."""
     try:
         clean_name = company_name.split()[0].replace("Ltd", "").replace("Limited", "").strip()
-        print(f" [Scuttlebutt] Searching ValuePickr forum for '{clean_name}'...")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Scuttlebutt] Searching ValuePickr forum for '{clean_name}'...")
         res = requests.get(VALUEPICKR_API_URL.format(term=clean_name), headers=DEFAULT_HEADERS, timeout=5)
 
         if res.status_code != 200:
@@ -339,13 +339,13 @@ def fetch_valuepickr_sentiment(company_name):
 
         posts = res.json().get('posts', [])
         if posts:
-            print(f" [Scuttlebutt] Found {len(posts)} recent posts for {clean_name}.")
+            print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Scuttlebutt] Found {len(posts)} recent posts for {clean_name}.")
             return " ".join([p.get('blurb', '') for p in posts[:5]])[:1500]
         else:
-            print(f" [Scuttlebutt] No posts found for {clean_name}.")
+            print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Scuttlebutt] No posts found for {clean_name}.")
             return "No active forum discussion found."
     except Exception as e:
-        print(f" [Scuttlebutt Error] ValuePickr search failed: {e}")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Scuttlebutt Error] ValuePickr search failed: {e}")
         return "Forum search bypassed."
 
 def extract_text_from_pdf_url(pdf_url, headline):
@@ -360,12 +360,12 @@ def extract_text_from_pdf_url(pdf_url, headline):
     financial_keywords = ["financial result", "outcome of board meeting", "earnings", "annual report", "financial statement"]
     is_heavy_financial = any(kw in headline_lower for kw in financial_keywords)
 
-    max_pages, max_chars = (15, 50000) if is_heavy_financial else (4, 10000)
+    max_pages, max_chars = (15, 20000) if is_heavy_financial else (4, 10000)
 
     if is_heavy_financial:
-        print(f" [PDF Router] Financial terms detected. Using heavy pdfplumber extractor (Limit: {max_chars} chars)...")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [PDF Router] Financial terms detected. Using heavy pdfplumber extractor (Limit: {max_chars} chars)...")
     else:
-        print(f" [PDF Router] Standard filing detected. Using fast pypdf extractor (Limit: {max_chars} chars)...")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [PDF Router] Standard filing detected. Using fast pypdf extractor (Limit: {max_chars} chars)...")
 
     try:
         res = requests.get(pdf_url, headers=DEFAULT_HEADERS, timeout=15)
@@ -394,7 +394,7 @@ def extract_text_from_pdf_url(pdf_url, headline):
         # [VISION OCR FALLBACK CHECK]
         # If text is nearly empty, it's a flat image scan (very common in SME court orders/factory docs)
         if len(clean_text) < 80 and gemini_client:
-            print(f" [Vision Fallback] Blank/Scanned PDF detected. Passing bytes to Gemini Flash Vision OCR...")
+            print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Vision Fallback] Blank/Scanned PDF detected. Passing bytes to Gemini Flash Vision OCR...")
             try:
                 throttle_api()
                 resp = gemini_client.models.generate_content(
@@ -407,7 +407,7 @@ def extract_text_from_pdf_url(pdf_url, headline):
                 clean_text = resp.text.strip()
                 print(" [Vision Fallback] Successfully OCR'd scanned document.")
             except Exception as e:
-                print(f" [Vision Fallback Error] Unable to read scanned document: {e}")
+                print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Vision Fallback Error] Unable to read scanned document: {e}")
 
         return clean_text[:max_chars] if clean_text else "Unextractable text."
     except Exception as e:
@@ -450,52 +450,81 @@ def run_sieve20_batch(announcements, master_results):
 
                         if status == "HIT":
                             hits.append(ann_item)
-                            print(f" [SIEVE 20 HIT] {ann_item['company']} | {reason}")
+                            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [SIEVE 20 HIT] {ann_item['company']} | {reason}")
                         else:
                             # [STATE UPDATE] Document died at Sieve 20. Mark terminal stage and save to master list.
                             ann_item["terminal_stage"] = 20
                             ann_item["status"] = "REJECTED_SIEVE20"
                             master_results.append(ann_item)
-                            print(f" [SIEVE 20 REJECT] {ann_item['company']} | {reason}")
+                            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [SIEVE 20 REJECT] {ann_item['company']} | {reason}")
                 break
             except Exception as e:
                 if "503" in str(e) or "429" in str(e):
                     time.sleep(2 ** attempt)
                     continue
-                print(f"[Sieve 20 Error] Chunk failed: {e}. Defaulting to HIT.")
+                print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Sieve 20 Error] Chunk failed: {e}. Defaulting to HIT.")
                 hits.extend(chunk)
                 break
 
     return hits
 
+
 def run_sieve40_extraction(item):
     """
-    [SIEVE 40] Downloads the PDF, extracts text, and uses the local model to score it.
+    [SIEVE 40] Downloads the PDF, extracts text, and uses the Groq API to score it.
     [IMPROVEMENT 2: PART A] Regex parser successfully grabs numeric deal value from the summary block.
     """
-    print(f" [SIEVE 40] Downloading and parsing PDF for {item['company']}...")
-    text = extract_text_from_pdf_url(item['all_links'][0] if item.get('all_links') else item.get('link', ''), item['headline'])
+    print(
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [SIEVE 40] Downloading and parsing PDF for {item['company']}...")
+    text = extract_text_from_pdf_url(item['all_links'][0] if item.get('all_links') else item.get('link', ''),
+                                     item['headline'])
     item['raw_pdf_text'] = text
-    item['deal_value_cr'] = 0.0 # Default value
+    item['deal_value_cr'] = 0.0  # Default value
 
-    # We only pass the first 4,500 chars to local model to save CPU cycles.
     if not text or len(text) < 80:
-        print(f" [SIEVE 40] No readable text found. Bypassing extraction.")
+        print(
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [SIEVE 40] No readable text found for {item['company']}. Defaulting score to 5.")
         item['sieve40_summary'], item['sieve40_score'] = "No local extraction.", 5
         return item
+
+    # Dynamic text slicing: 20k chars for heavy financials, 10k for standard announcements
+    is_heavy_financial = any(kw in item.get('headline', '').lower() for kw in
+                             ['financial results', 'outcome of board meeting', 'audited', 'unaudited'])
+    max_chars = 20000 if is_heavy_financial else 10000
 
     prompt = f"""Extract key facts and assign a PreScore (1 to 10).
     Score 1-4: Trade expo, generic PR, minor updates.
     Score 5-6: Small/routine purchase orders, incremental progress.
     Score 7-10: Hard confirmed wins (>50Cr), net-debt reduction, major capex, strong financial beats.
-    Document Text: {item['headline']}\n{text[:4500]}\nOutput format:\nSummary: [150 words]\nValue: [Exact value]\nClient: [Entity]\nPreScore: [Integer 1-10]"""
+    Document Text: {item['headline']}\n{text[:max_chars]}\nOutput format:\nSummary: [150 words]\nValue: [Exact value]\nClient: [Entity]\nPreScore: [Integer 1-10]"""
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv("GROQ_API_KEY")}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system",
+             "content": "You are a precise financial analyst extracting metrics from corporate announcements."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+        "stream": False
+    }
 
     try:
-        print(f" [SIEVE 40] Triggering local {OLLAMA_MODEL} model for {item['company']}...")
-        res = requests.post(OLLAMA_API_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}}, timeout=90)
+        print(
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [SIEVE 40] Triggering Groq API ({OLLAMA_MODEL}) for {item['company']}...")
+        # Inside your loop or right before triggering the API:
+        time.sleep(3)
+        res = requests.post(OLLAMA_API_URL, headers=headers, json=payload, timeout=60)
 
         if res.status_code == 200:
-            extracted = res.json().get("response", "").strip()
+            response_data = res.json()
+            extracted = response_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
             score_match = re.search(r'PreScore.*?(\b10|[1-9])\b', extracted, re.IGNORECASE)
             item['sieve40_score'] = int(score_match.group(1)) if score_match else 5
             item['sieve40_summary'] = extracted
@@ -512,13 +541,19 @@ def run_sieve40_extraction(item):
                 else:
                     item['deal_value_cr'] = val
 
-            print(f" [SIEVE 40] Scored {item['sieve40_score']}/10. Extracted Deal Value: ~{item['deal_value_cr']} Cr.")
+            print(
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [SIEVE 40] Scored {item['sieve40_score']}/10. Extracted Deal Value: ~{item['deal_value_cr']} Cr.")
             return item
+        else:
+            print(
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [SIEVE 40] Groq API HTTP error {res.status_code}: {res.text}")
     except Exception as e:
-        print(f" [SIEVE 40 Warning] Local Ollama failed: {e}")
+        print(
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [SIEVE 40] Groq connection failed ({e}). Defaulting score to 5.")
 
-    item['sieve40_summary'], item['sieve40_score'] = "Local inference failed.", 5
+    item['sieve40_summary'], item['sieve40_score'] = "Groq inference failed.", 5
     return item
+
 
 def build_sieve60_prompt(item, market_data, forum_text):
     """
@@ -531,7 +566,7 @@ def build_sieve60_prompt(item, market_data, forum_text):
     if deal_cr > 0 and mcap_cr > 0:
         ratio = (deal_cr / mcap_cr) * 100
         anchor_text = f"\nQUANTITATIVE ANCHOR: The extracted deal value is ~INR {deal_cr} Cr, representing exactly {ratio:.1f}% of the current market cap.\n"
-        print(f" [Prompt Builder] Injected Quantitative Anchor: {ratio:.1f}% of Market Cap.")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Prompt Builder] Injected Quantitative Anchor: {ratio:.1f}% of Market Cap.")
 
     return f"""Assess how strongly this event will impact future earnings power. Disregard market cap (evaluate proportional impact).
     Company: {item['company']} | Price: {market_data['price']} | 20D Vol: {market_data['vol_multiple']}x | 52W High Dist: {market_data['dist_52w_high']}%
@@ -583,7 +618,7 @@ def run_staggered_sieve60_workers(candidates, master_results):
             forum_data = item.get('forum_data') or fetch_valuepickr_sentiment(item['company'])
             item.update({'market_data': market_data, 'forum_data': forum_data})
 
-            print(f"\n[{model_name.upper()} Worker - Stage {stage}] Analyzing {item['company']}...")
+            print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [{model_name.upper()} Worker - Stage {stage}] Analyzing {item['company']}...")
             output = client_func(build_sieve60_prompt(item, market_data, forum_data))
             cat_score, comp_score = extract_scores(output)
 
@@ -594,11 +629,11 @@ def run_staggered_sieve60_workers(candidates, master_results):
             if stage == 1:
                 # [DECISION] If the first model scores it >= 5, pass to the second model to get a consensus.
                 if cat_score >= 5:
-                    print(f" -> [{model_name.upper()}] Score {cat_score}/10 >= 5. Handing off to Stage 2.")
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}   -> [{model_name.upper()}] Score {cat_score}/10 >= 5. Handing off to Stage 2.")
                     queue_out.put((20 - cat_score, next(counter), {'item': item, 'stage': 2}))
                 else:
                     # [STATE UPDATE] First model hated it. Kill it early to save API tokens.
-                    print(f" -> [{model_name.upper()}] Early Exit! Score {cat_score}/10 < 5. Terminating.")
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}   -> [{model_name.upper()}] Early Exit! Score {cat_score}/10 < 5. Terminating.")
                     item['terminal_stage'] = 60
                     item['status'] = "SINGLE_MODEL_IGNORE"
                     item['final_score'] = cat_score
@@ -608,7 +643,7 @@ def run_staggered_sieve60_workers(candidates, master_results):
 
             elif stage == 2:
                 # [DECISION] Both models have scored it. Calculate the consensus average.
-                print(f" -> [{model_name.upper()}] Stage 2 Complete. Finalizing consensus.")
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}   -> [{model_name.upper()}] Stage 2 Complete. Finalizing consensus.")
                 c_cat = item.get('sieve60_claude_score', 1)
                 g_cat = item.get('sieve60_gemini_score', 1)
 
@@ -742,11 +777,11 @@ def dispatch_deferred_alerts(pipeline_results):
                     "reply_markup": {"inline_keyboard": inline_keyboard}
                 }
 
-                print(f" [Telegram] Dispatching payload for {item['company']}...")
+                print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Telegram] Dispatching payload for {item['company']}...")
                 requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json=payload, timeout=8)
                 time.sleep(0.5) # Anti-spam buffer
             except Exception as e:
-                print(f" [Telegram Error] Dispatch failed for {item['company']}: {e}")
+                print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Telegram Error] Dispatch failed for {item['company']}: {e}")
 
         # Ledger & DB Caching for all processed items
         if stage >= 60:
@@ -776,12 +811,12 @@ def process_youtube_interviews(channel_id=DEFAULT_YOUTUBE_CHANNEL_ID):
             res = gemini_client.models.generate_content(model=TIER1_MODEL, contents=prompt)
 
             if "IGNORE" not in res.text:
-                print(f" [YouTube Hit] Catalyst found in: {entry.title}")
+                print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [YouTube Hit] Catalyst found in: {entry.title}")
                 if VERBOSITY_LEVEL <= 1000:
                     btn = {"inline_keyboard": [[{"text": "📺 Watch Interview", "url": entry.link}]]}
                     requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": f"📺 <b>MANAGEMENT INTERVIEW CATALYST</b>\n\n<b>Title:</b> {entry.title}", "parse_mode": "HTML", "reply_markup": btn}, timeout=8)
     except Exception as e:
-        print(f" [YouTube Scanner Error] {e}")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [YouTube Scanner Error] {e}")
 
 def fetch_live_nse_filings():
     """[EXTERNAL API] Hits the NSE API using a Session to preserve cookies and bypass basic bot protection."""
@@ -801,9 +836,9 @@ def fetch_live_nse_filings():
                 if pdf_link and not pdf_link.startswith('http'):
                     pdf_link = f"{NSE_BASE_URL}{pdf_link}"
                 standardized_filings.append({'id': str(attachment), 'company': item.get('sm_name', item.get('symbol', 'Unknown')), 'scrip': item.get('symbol', ''), 'headline': item.get('subject', item.get('desc', '')), 'isin': 'N/A', 'link': pdf_link, 'exchange': 'NSE'})
-        print(f" [NSE] Successfully fetched {len(standardized_filings)} filings.")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [NSE] Successfully fetched {len(standardized_filings)} filings.")
     except Exception as e:
-        print(f" [NSE Ingestion Error] {e}")
+        print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [NSE Ingestion Error] {e}")
     return standardized_filings
 
 def fetch_live_bse_filings(max_pages=100):
@@ -825,18 +860,31 @@ def fetch_live_bse_filings(max_pages=100):
             else:
                 break
         except Exception as e:
-            print(f" [BSE Ingestion Notice on Page {page}] {e}")
+            print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [BSE Ingestion Notice on Page {page}] {e}")
             break
 
-    print(f" [BSE] Successfully fetched {len(standardized_filings)} filings across {page - 1} pages.")
+    print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [BSE] Successfully fetched {len(standardized_filings)} filings across {page - 1} pages.")
     return standardized_filings
+
+
+def print_stage_telemetry(stage_name, total_input, survived_count, pipeline_results, terminal_stage_num):
+    """[TELEMETRY] Reusable method to print drop-off stats immediately after any sieve."""
+    rejects_count = len([item for item in pipeline_results if item.get('terminal_stage') == terminal_stage_num])
+    print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  =======================================================")
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  🛡️ {stage_name.upper()} COMPLETE")
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  =======================================================")
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  • Evaluated Input : {total_input} entities")
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  • Rejected / Dead : {rejects_count}")
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  • Survived to Next: {survived_count}")
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  =======================================================\n")
 
 # ---------------------------------------------------------------------------
 # 7. MAIN PIPELINE ORCHESTRATOR
 # ---------------------------------------------------------------------------
 def main():
+    print(f"Value of sieve 40 model being used is : {OLLAMA_MODEL}")
     start_time = time.time()
-    print(f"[{datetime.now()}] Initializing Pipeline (Verbosity: {VERBOSITY_LEVEL} | Env: {EXECUTION_ENVIRONMENT})...")
+    print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [{datetime.now()}] Initializing Pipeline (Verbosity: {VERBOSITY_LEVEL} | Env: {EXECUTION_ENVIRONMENT})...")
 
     unified = fetch_live_bse_filings(max_pages=args.max_pages) + fetch_live_nse_filings()
     unprocessed = filter_unprocessed_announcements(unified)
@@ -848,12 +896,20 @@ def main():
     grouped = group_filings_by_company(unprocessed)
     pipeline_results = []
 
-    print(f"\n[SIEVE 20] Broad-net noise filtering on {len(grouped)} filings...")
+    print(f"\n {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [SIEVE 20] Broad-net noise filtering on {len(grouped)} filings...")
     sieve20_hits = run_sieve20_batch(grouped, pipeline_results)
+
+    print_stage_telemetry(
+        stage_name="Sieve 20 (Flash Noise Filter)",
+        total_input=len(grouped),
+        survived_count=len(sieve20_hits),
+        pipeline_results=pipeline_results,
+        terminal_stage_num=20
+    )
 
     sieve40_hits = []
     if sieve20_hits:
-        print(f"\n[SIEVE 40] Executing Dynamic Extraction & Pre-Scoring on {len(sieve20_hits)} hits...")
+        print(f"\n {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [SIEVE 40] Executing Dynamic Extraction & Pre-Scoring on {len(sieve20_hits)} hits...")
         for item in sieve20_hits:
             item = run_sieve40_extraction(item)
             if item.get('sieve40_score', 5) >= SIEVE_40_MIN_SCORE:
@@ -864,9 +920,27 @@ def main():
                 item['status'] = "REJECTED_SIEVE40"
                 pipeline_results.append(item)
 
+    print_stage_telemetry(
+        stage_name="Sieve 40 (Local LLM Pre-Score)",
+        total_input=len(sieve20_hits),
+        survived_count=len(sieve40_hits),
+        pipeline_results=pipeline_results,
+        terminal_stage_num=40
+    )
+
     if sieve40_hits:
-        print(f"\n[SIEVE 60] Handing off {len(sieve40_hits)} candidates to Claude & Gemini for deep reasoning...")
+        print(f"\n {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [SIEVE 60] Handing off {len(sieve40_hits)} candidates to Claude & Gemini for deep reasoning...")
         run_staggered_sieve60_workers(sieve40_hits[:args.max_sieve60] if args.max_sieve60 > 0 else sieve40_hits, pipeline_results)
+
+    sieve60_passed = [item for item in pipeline_results if
+                      item.get('terminal_stage') == 60 and item.get('final_score', 0) >= 6]
+    print_stage_telemetry(
+        stage_name="Sieve 60 (Claude & Gemini Consensus)",
+        total_input=len(sieve40_hits),
+        survived_count=len(sieve60_passed),
+        pipeline_results=pipeline_results,
+        terminal_stage_num=60
+    )
 
     # ---------------------------------------------------------------------------
     # FINAL DISPATCH & TELEMETRY
@@ -902,7 +976,7 @@ def main():
         try:
             requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": digest_msg, "parse_mode": "HTML"}, timeout=8)
         except Exception as e:
-            print(f" [Telegram Digest Error] {e}")
+            print(f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Telegram Digest Error] {e}")
 
     process_youtube_interviews()
     print(f"[{datetime.now()}] Execution finished successfully in {round(duration, 1)}s.")
