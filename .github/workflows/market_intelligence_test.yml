@@ -1,0 +1,55 @@
+name: Market Intelligence Calibration Test
+
+on:
+  workflow_dispatch: # Allows manual trigger from the GitHub UI
+
+jobs:
+  run-sieve-calibration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai anthropic python-dotenv requests
+
+      # ----------------------------------------------------
+      # OLLAMA & QWEN 2.5 CACHING SETUP (Crucial for Speed)
+      # ----------------------------------------------------
+      - name: Cache Ollama Models
+        id: cache-ollama
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-qwen2.5-7b-${{ runner.os }}
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama Server in Background
+        run: ollama serve &
+
+      - name: Pull Qwen 2.5 7B Model (Instant if Cached)
+        run: |
+          sleep 3 # Give server a moment to start
+          ollama pull qwen2.5:7b
+
+      # ----------------------------------------------------
+      # RUN THE TEST SCRIPT
+      # ----------------------------------------------------
+      - name: Execute Calibration Suite
+        env:
+          GEMINI_API_KEY_PAID: ${{ secrets.GEMINI_API_KEY_PAID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OLLAMA_MODEL: "qwen2.5:7b"
+        run: |
+          python test_github_actions_calibration.py
