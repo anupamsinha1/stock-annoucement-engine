@@ -61,6 +61,8 @@ jobs:
 
       - name: Execute GitHub Screening Engine
         env:
+          #Choose between GITHUB or LOCAL
+          EXECUTION_ENVIRONMENT: "GITHUB"
           GEMINI_API_KEY_FREE: ${{ secrets.GEMINI_API_KEY_FREE }}
           GEMINI_API_KEY_PAID: ${{ secrets.GEMINI_API_KEY_PAID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

@@ -1,11 +1,11 @@
 """
-Market Intelligence & Corporate Announcement Screening Engine (GitHub Actions Edition)
+Market Intelligence & Corporate Announcement Screening Engine
 =======================================================================================
 Architecture & Features:
 - State Machine Tracker: Defers all Telegram alerts to the end of the pipeline.
 - Cascading Verbosity (20, 40, 60, 1000): Dictates pipeline telemetry via Threshold Gatekeeper.
 - Sieve 20 (Flash Lite): Administrative Noise Gatekeeper.
-- Sieve 40 (Qwen 7B): Local Fluff/Pre-Score Gatekeeper (4.5k chars extraction).
+- Sieve 40 (Local LLM): Local Fluff/Pre-Score Gatekeeper (4.5k chars extraction).
 - Sieve 60 (Claude & Gemini): Deep Dive Consensus (Full 50k chars pdfplumber payload).
 """
 
@@ -43,10 +43,34 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logging.getLogger("google").setLevel(logging.ERROR)
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 
-# ---------------------------------------------------------------------------
-# 1. ENVIRONMENT & CLI ARGUMENT SETUP
-# ---------------------------------------------------------------------------
+# Loads local variables from .env file (if it exists)
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# 1. EXECUTION ENVIRONMENT & CONFIGURATION
+# ---------------------------------------------------------------------------
+# [ENVIRONMENT SWITCH]
+# This pulls the environment dynamically.
+# - Locally, it reads from your .env file.
+# - On GitHub, it reads from your scan.yml file.
+# - If not found anywhere, it defaults to "GITHUB".
+#
+# Possible values:
+#   "GITHUB" -> Uses 'qwen2.5:7b' (Optimized for GitHub Actions 4-core runners)
+#   "LOCAL"  -> Uses 'llama3' (Perfect for local testing on your personal machine)
+# ---------------------------------------------------------------------------
+EXECUTION_ENVIRONMENT = os.getenv("EXECUTION_ENVIRONMENT", "GITHUB")
+
+# Set the default local AI model based on the environment chosen above
+if EXECUTION_ENVIRONMENT.upper() == "LOCAL":
+    DEFAULT_LOCAL_MODEL = "llama3"
+else:
+    DEFAULT_LOCAL_MODEL = "qwen2.5:7b"
+
+# Pull API Keys and model names from the .env file (or use the defaults we just set)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", DEFAULT_LOCAL_MODEL)
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
+USE_LOCAL_EXTRACTOR = os.getenv("USE_LOCAL_EXTRACTOR", "true").lower() in ("true", "1", "yes")
 
 # Define the source URLs where we will scrape the data
 BSE_API_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno={page}&strCat=-1&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
@@ -56,7 +80,6 @@ NSE_API_URL = "https://www.nseindia.com/api/corporate-announcements?index=equiti
 VALUEPICKR_API_URL = "https://forum.valuepickr.com/search/query.json?term={term}"
 YOUTUBE_RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
-DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
 # Headers make our Python script look like a real web browser to avoid getting blocked
 DEFAULT_HEADERS = {
@@ -81,7 +104,7 @@ NSE_HEADERS = {
 # 60   = Sends Sieve 60 results only (Passes and early exits)
 # 1000 = Production Mode: Sends ONLY fully passed Sieve 60 filings (Score >= 6)
 # ---------------------------------------------------------------------------
-VERBOSITY_LEVEL = float(os.getenv("VERBOSITY_LEVEL", "40.0"))
+VERBOSITY_LEVEL = float(os.getenv("VERBOSITY_LEVEL", "1000.0"))
 
 DEFAULT_CHUNK_SIZE = 50
 DEFAULT_YOUTUBE_CHANNEL_ID = "UCb5hMTAFjG5j79V6nL3_YCQ"
@@ -97,9 +120,7 @@ args, _ = parser.parse_known_args()
 
 IGNORE_CACHE = args.ignore_cache or os.getenv("IGNORE_CACHE", "false").lower() in ("true", "1", "yes")
 
-# Pull API Keys from .env file
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", DEFAULT_OLLAMA_URL)
+# Pull Cloud API Keys from the .env file
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY_PAID") or os.getenv("GEMINI_API_KEY_FREE")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -183,7 +204,7 @@ def group_filings_by_company(filings):
     return list(grouped.values())
 
 def log_announcements_batch(decisions_list):
-    """Saves basic triage decisions (HIT/IGNORE) so we don't process them again for 7 days."""
+    """[STATE UPDATE] Saves basic triage decisions (HIT/IGNORE) so we don't process them again for 7 days."""
     if not decisions_list: return
     conn = get_db_connection()
     if not conn: return
@@ -196,7 +217,7 @@ def log_announcements_batch(decisions_list):
     except Exception: pass
 
 def log_permanent_ledger(item, market_data):
-    """Saves the massive, deep-dive AI analysis into our permanent historical tracker."""
+    """[STATE UPDATE] Saves the massive, deep-dive AI analysis into our permanent historical tracker."""
     conn = get_db_connection()
     if not conn: return
     try:
@@ -231,10 +252,11 @@ def log_permanent_ledger(item, market_data):
 # 3. METRICS & EXTRACTION ROUTER
 # ---------------------------------------------------------------------------
 def fetch_market_metrics(scrip_code, exchange):
-    """Calculates stock price, 20-day volume surge, and moving averages using Yahoo Finance."""
+    """[CALCULATION] Fetches live stock price, 20-day volume surge, and moving averages using Yahoo Finance."""
     default_payload = {"price": 0.0, "vol_multiple": 1.0, "above_50dma": False, "above_200dma": False, "dist_52w_high": 0.0, "market_cap_cr": 0.0}
     if not scrip_code: return default_payload
     try:
+        print(f" [Metrics] Fetching market data for {exchange}:{scrip_code}...")
         ticker = f"{scrip_code}.NS" if exchange == "NSE" else f"{scrip_code}.BO"
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1y")
@@ -242,7 +264,7 @@ def fetch_market_metrics(scrip_code, exchange):
 
         current_price = round(float(hist['Close'].iloc[-1]), 2)
 
-        # [CALCULATION] Compare today's volume to the average of the last 20 days
+        # Compare today's volume to the average of the last 20 days
         avg_20_volume = float(hist['Volume'].iloc[-21:-1].mean()) if len(hist) >= 21 else float(hist['Volume'].iloc[-1])
         vol_multiple = round((float(hist['Volume'].iloc[-1]) / avg_20_volume), 2) if avg_20_volume > 0 else 1.0
 
@@ -250,12 +272,34 @@ def fetch_market_metrics(scrip_code, exchange):
         dma_200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) >= 200 else current_price
         high_52w = float(hist['High'].max())
 
-        # [CALCULATION] How far away is the stock from its 52-week peak?
+        # How far away is the stock from its 52-week peak?
         dist_52w_high = round(((current_price - high_52w) / high_52w) * 100, 1) if high_52w > 0 else 0.0
 
         market_cap_cr = round(getattr(stock.fast_info, 'market_cap', 0) / 1e7, 2)
         return {"price": current_price, "vol_multiple": vol_multiple, "above_50dma": bool(current_price > dma_50), "above_200dma": bool(current_price > dma_200), "dist_52w_high": dist_52w_high, "market_cap_cr": market_cap_cr}
-    except Exception: return default_payload
+    except Exception as e:
+        print(f" [Metrics Error] Failed to fetch data for {scrip_code}: {e}")
+        return default_payload
+
+def fetch_valuepickr_sentiment(company_name):
+    """[EXTERNAL API] Scrapes the ValuePickr forum to see if retailers are discussing this stock."""
+    try:
+        clean_name = company_name.split()[0].replace("Ltd", "").replace("Limited", "").strip()
+        print(f" [Scuttlebutt] Searching ValuePickr forum for '{clean_name}'...")
+        res = requests.get(VALUEPICKR_API_URL.format(term=clean_name), headers=DEFAULT_HEADERS, timeout=5)
+
+        if res.status_code != 200:
+            return "No active forum discussion found."
+
+        posts = res.json().get('posts', [])
+        if posts:
+            print(f" [Scuttlebutt] Found {len(posts)} recent posts for {clean_name}.")
+            return " ".join([p.get('blurb', '') for p in posts[:5]])[:1500]
+        else:
+            return "No active forum discussion found."
+    except Exception as e:
+        print(f" [Scuttlebutt Error] ValuePickr search failed: {e}")
+        return "Forum search bypassed."
 
 def extract_text_from_pdf_url(pdf_url, headline):
     """
@@ -269,6 +313,11 @@ def extract_text_from_pdf_url(pdf_url, headline):
     is_heavy_financial = any(kw in headline_lower for kw in financial_keywords)
 
     max_pages, max_chars = (15, 50000) if is_heavy_financial else (4, 10000)
+
+    if is_heavy_financial:
+        print(f" [PDF Router] Financial terms detected in headline. Using heavy pdfplumber extractor (Limit: {max_chars} chars)...")
+    else:
+        print(f" [PDF Router] Standard filing detected. Using fast pypdf extractor (Limit: {max_chars} chars)...")
 
     try:
         res = requests.get(pdf_url, headers=DEFAULT_HEADERS, timeout=15)
@@ -295,7 +344,7 @@ def extract_text_from_pdf_url(pdf_url, headline):
     except Exception as e: return f"PDF error: {e}"
 
 def extract_score(text, label):
-    """Helper function to find a score like 'Catalyst Score: 8/10' inside AI text."""
+    """[PARSER] Helper function to find a score like 'Catalyst Score: 8/10' inside AI text."""
     if not text: return None
     for line in text.splitlines():
         if label.lower() in line.lower():
@@ -310,7 +359,7 @@ def extract_score(text, label):
 # ---------------------------------------------------------------------------
 def run_sieve20_batch(announcements, master_results):
     """
-    SIEVE 20: Reads just the headline of 50 filings at once using fast Gemini Flash.
+    [SIEVE 20] Reads just the headline of 50 filings at once using fast Gemini Flash.
     Any routine noise (newspaper clippings, lost shares) gets rejected immediately.
     """
     if not announcements or not gemini_client: return []
@@ -338,11 +387,13 @@ def run_sieve20_batch(announcements, master_results):
 
                         if status == "HIT":
                             hits.append(ann_item)
+                            print(f" [SIEVE 20 HIT] {ann_item['company']} | {reason}")
                         else:
                             # [STATE UPDATE] Document died at Sieve 20. Mark terminal stage and save to master list.
                             ann_item["terminal_stage"] = 20
                             ann_item["status"] = "REJECTED_SIEVE20"
                             master_results.append(ann_item)
+                            print(f" [SIEVE 20 REJECT] {ann_item['company']} | {reason}")
                 break
             except Exception as e:
                 if "503" in str(e) or "429" in str(e): time.sleep(2 ** attempt); continue
@@ -352,14 +403,16 @@ def run_sieve20_batch(announcements, master_results):
 
 def run_sieve40_extraction(item):
     """
-    SIEVE 40: Downloads the PDF, extracts text, and uses local Qwen to score it.
-    If it's marketing fluff disguised as a contract, Qwen will score it low and kill it here.
+    [SIEVE 40] Downloads the PDF, extracts text, and uses the local model to score it.
+    If it's marketing fluff disguised as a contract, the local model will score it low and kill it here.
     """
+    print(f" [SIEVE 40] Downloading and parsing PDF for {item['company']}...")
     text = extract_text_from_pdf_url(item['all_links'][0] if item.get('all_links') else item.get('link', ''), item['headline'])
     item['raw_pdf_text'] = text
 
-    # [DECISION] We only pass the first 4,500 chars to local Qwen to save CPU cycles.
+    # [DECISION] We only pass the first 4,500 chars to local model to save CPU cycles.
     if not text or len(text) < 80:
+        print(f" [SIEVE 40] No readable text found. Bypassing extraction.")
         item['sieve40_summary'], item['sieve40_score'] = "No local extraction.", 5
         return item
 
@@ -370,6 +423,7 @@ def run_sieve40_extraction(item):
     Document Text: {item['headline']}\n{text[:4500]}\nOutput format:\nSummary: [150 words]\nValue: [Exact value]\nClient: [Entity]\nPreScore: [Integer 1-10]"""
 
     try:
+        print(f" [SIEVE 40] Triggering local {OLLAMA_MODEL} model for {item['company']}...")
         res = requests.post(OLLAMA_API_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}}, timeout=90)
         if res.status_code == 200:
             extracted = res.json().get("response", "").strip()
@@ -377,7 +431,9 @@ def run_sieve40_extraction(item):
             item['sieve40_score'] = int(score_match.group(1)) if score_match else 5
             item['sieve40_summary'] = extracted
             return item
-    except Exception: pass
+    except Exception as e:
+        print(f" [SIEVE 40 Warning] Local Ollama failed: {e}")
+
     item['sieve40_summary'], item['sieve40_score'] = "Local inference failed.", 5
     return item
 
@@ -394,7 +450,7 @@ def build_sieve60_prompt(item, market_data, forum_text):
 
 def run_staggered_sieve60_workers(candidates, master_results):
     """
-    SIEVE 60: The heavy-lifters (Claude and Gemini Pro).
+    [SIEVE 60] The heavy-lifters (Claude and Gemini Pro).
     Uses a priority queue to hand off filings between models.
     """
     if not candidates: return
@@ -426,7 +482,7 @@ def run_staggered_sieve60_workers(candidates, master_results):
             forum_data = item.get('forum_data') or fetch_valuepickr_sentiment(item['company'])
             item.update({'market_data': market_data, 'forum_data': forum_data})
 
-            print(f"\n[{model_name.upper()} Stage {stage}] Analyzing {item['company']}...")
+            print(f"\n[{model_name.upper()} Worker - Stage {stage}] Analyzing {item['company']}...")
             output = client_func(build_sieve60_prompt(item, market_data, forum_data))
             cat_score, comp_score = extract_scores(output)
 
@@ -437,9 +493,11 @@ def run_staggered_sieve60_workers(candidates, master_results):
             if stage == 1:
                 # [DECISION] If the first model scores it >= 5, pass to the second model to get a consensus.
                 if cat_score >= 5:
+                    print(f" -> [{model_name.upper()}] Score {cat_score}/10 >= 5. Handing off to Stage 2.")
                     queue_out.put((20 - cat_score, next(counter), {'item': item, 'stage': 2}))
                 else:
                     # [STATE UPDATE] First model hated it. Kill it early to save API tokens.
+                    print(f" -> [{model_name.upper()}] Early Exit! Score {cat_score}/10 < 5. Terminating.")
                     item['terminal_stage'] = 60
                     item['status'] = "SINGLE_MODEL_IGNORE"
                     item['final_score'] = cat_score
@@ -448,8 +506,10 @@ def run_staggered_sieve60_workers(candidates, master_results):
                         completed_count += 1
             elif stage == 2:
                 # [DECISION] Both models have scored it. Calculate the consensus average.
+                print(f" -> [{model_name.upper()}] Stage 2 Complete. Finalizing consensus.")
                 c_cat, g_cat = item.get('sieve60_claude_score', 1), item.get('sieve60_gemini_score', 1)
                 is_divergent = (abs(c_cat - g_cat) >= 4 or (c_cat >= 7 and g_cat <= 4) or (g_cat >= 7 and c_cat <= 4))
+
                 if is_divergent: status = "MODEL_DIVERGENCE"
                 elif c_cat >= 7 and g_cat >= 7: status = "CONSENSUS_HIT"
                 elif c_cat <= 4 and g_cat <= 4: status = "CONSENSUS_IGNORE"
@@ -520,7 +580,7 @@ def build_html_telegram_message(item):
     if item.get('sieve20_reason'):
         msg += f"\n🔍 <b>Sieve 20 Rationale:</b>\n{item['sieve20_reason']}\n"
     if stage >= 40 and item.get('sieve40_summary'):
-        msg += f"\n🤖 <b>Sieve 40 Qwen Pre-Score ({item.get('sieve40_score', 'N/A')}/10):</b>\n{item['sieve40_summary'][:600]}...\n"
+        msg += f"\n🤖 <b>Sieve 40 Score ({item.get('sieve40_score', 'N/A')}/10):</b>\n{item['sieve40_summary'][:600]}...\n"
     if stage == 60:
         if item.get('sieve60_claude_analysis'): msg += f"\n🧠 <b>Claude (Sieve 60):</b>\n{item['sieve60_claude_analysis']}\n"
         if item.get('sieve60_gemini_analysis'): msg += f"\n🤖 <b>Gemini (Sieve 60):</b>\n{item['sieve60_gemini_analysis']}\n"
@@ -576,9 +636,10 @@ def dispatch_deferred_alerts(pipeline_results):
 # 6. RAW DATA INGESTION METHODS
 # ---------------------------------------------------------------------------
 def process_youtube_interviews(channel_id=DEFAULT_YOUTUBE_CHANNEL_ID):
-    """Downloads recent TV interviews and asks Gemini to look for capex/guidance mentions."""
+    """[EXTERNAL API] Downloads recent TV interviews and asks Gemini to look for capex/guidance mentions."""
     if not gemini_client: return
     try:
+        print(" [YouTube] Scanning recent management interviews...")
         feed = feedparser.parse(YOUTUBE_RSS_URL.format(channel_id=channel_id))
         cutoff = datetime.now(timezone.utc) - timedelta(days=15)
         for entry in feed.entries[:4]:
@@ -591,14 +652,15 @@ def process_youtube_interviews(channel_id=DEFAULT_YOUTUBE_CHANNEL_ID):
             res = gemini_client.models.generate_content(model=TIER1_MODEL, contents=prompt)
 
             if "IGNORE" not in res.text:
-                print(f"[YouTube Hit] {entry.title}")
+                print(f" [YouTube Hit] Catalyst found in: {entry.title}")
                 if VERBOSITY_LEVEL <= 1000:  # Always send TV hits
                     requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": f"📺 <b>MANAGEMENT INTERVIEW CATALYST</b>\n\n<b>Title:</b> {entry.title}\n🔗 <a href=\"{entry.link}\">Watch Interview</a>", "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=8)
     except Exception as e:
         print(f"[YouTube Scanner Error] {e}")
 
 def fetch_live_nse_filings():
-    """Hits the NSE API using a Session to preserve cookies and bypass basic bot protection."""
+    """[EXTERNAL API] Hits the NSE API using a Session to preserve cookies and bypass basic bot protection."""
+    print(" [NSE] Fetching latest announcements from NSE India...")
     session = requests.Session()
     session.headers.update(NSE_HEADERS)
     standardized_filings = []
@@ -627,11 +689,13 @@ def fetch_live_nse_filings():
                     'link': pdf_link,
                     'exchange': 'NSE'
                 })
+            print(f" [NSE] Successfully fetched {len(standardized_filings)} filings.")
     except Exception as e: print(f"[NSE Ingestion Notice] {e}")
     return standardized_filings
 
 def fetch_live_bse_filings(max_pages=100):
-    """Paginates backward through the live BSE announcement feed."""
+    """[EXTERNAL API] Paginates backward through the live BSE announcement feed."""
+    print(" [BSE] Fetching latest announcements from BSE India...")
     standardized_filings = []
     page = 1
     while page <= max_pages:
@@ -659,6 +723,7 @@ def fetch_live_bse_filings(max_pages=100):
                 break
         except Exception as e:
             print(f"[BSE Ingestion Notice on Page {page}] {e}"); break
+    print(f" [BSE] Successfully fetched {len(standardized_filings)} filings across {page - 1} pages.")
     return standardized_filings
 
 
@@ -687,7 +752,7 @@ def main():
     # --- SIEVE 40 ---
     sieve40_hits = []
     if sieve20_hits:
-        print(f"\n[SIEVE 40] Executing Dynamic Extraction & Qwen Pre-Scoring on {len(sieve20_hits)} hits...")
+        print(f"\n[SIEVE 40] Executing Dynamic Extraction & Pre-Scoring on {len(sieve20_hits)} hits...")
         for item in sieve20_hits:
             item = run_sieve40_extraction(item)
             score = item.get('sieve40_score', 5)
@@ -708,14 +773,60 @@ def main():
     # --- DISPATCH ---
     dispatch_deferred_alerts(pipeline_results)
 
-    # Global Telegram Digest summarizing the run
+    # --- GLOBAL SUMMARY DIGEST ---
     duration = time.time() - start_time
-    digest = f"📊 <b>EXCHANGE SCAN COMPLETE</b>\n• <b>Verbosity:</b> {VERBOSITY_LEVEL}\n• <b>Total Screened:</b> {len(grouped)}\n• <b>Passed Sieve 40:</b> {len(sieve40_hits)}\n• <b>Latency:</b> {round(duration, 1)}s"
+
+    # Calculate exactly how many passed the final Sieve 60 successfully
+    sieve60_passed = [
+        item for item in pipeline_results
+        if item.get('terminal_stage') == 60 and item.get('final_score', 0) >= 6
+    ]
+
+    # Break down the Sieve 20 Rejections for the telemetry report
+    sieve20_rejects = [item for item in pipeline_results if item.get('terminal_stage') == 20]
+    sast_count = sum(1 for r in sieve20_rejects if any(k in r.get('sieve20_reason', '').lower() for k in ['sast', 'pit', 'insider', 'transfer']))
+    admin_count = sum(1 for r in sieve20_rejects if any(k in r.get('sieve20_reason', '').lower() for k in ['certificate', 'meeting', 'governance', 'window', 'newspaper']))
+    other_count = len(sieve20_rejects) - (sast_count + admin_count)
+
+    # Print a clean, formatted summary to the GitHub Actions Console
+    print(f"\n=======================================================")
+    print(f"📊 PIPELINE EXECUTION SUMMARY")
+    print(f"=======================================================")
+    print(f"• Total Filings Ingested : {len(unified)}")
+    print(f"• Unique Company Events  : {len(grouped)}")
+    print(f"• Passed Sieve 20 (Flash): {len(sieve20_hits)}")
+    print(f"• Passed Sieve 40 (Local): {len(sieve40_hits)}")
+    print(f"• Passed Sieve 60 (Final): {len(sieve60_passed)}")
+    print(f"• Execution Latency      : {round(duration, 1)}s")
+    print(f"=======================================================\n")
+
+    # Build the rich Telegram Digest
+    mode_text = "🔄 <b>Manual Refresh</b>" if IGNORE_CACHE else "⏰ <b>Scheduled GitHub Action Scan</b>"
+
+    digest_msg = (
+        f"📊 <b>EXCHANGE SCAN COMPLETE</b>\n"
+        f"• <b>Mode:</b> {mode_text}\n"
+        f"• <b>Verbosity Level:</b> {VERBOSITY_LEVEL}\n"
+        f"• <b>Total Screened:</b> {len(grouped)} entities\n"
+        f"• <b>Passed Sieve 20:</b> {len(sieve20_hits)}\n"
+        f"• <b>Passed Sieve 40:</b> {len(sieve40_hits)}\n"
+        f"• <b>Final Sieve 60 Hits:</b> {len(sieve60_passed)}\n"
+        f"• <b>Execution Latency:</b> {round(duration, 1)}s\n\n"
+        f"🚫 <b>Noise Filter Breakdown (Sieve 20):</b>\n"
+        f"• SAST / Insider Transfers: {sast_count}\n"
+        f"• Admin / Board Meetings: {admin_count}\n"
+        f"• Routine Disclosures: {max(0, other_count)}"
+    )
+
+    # Dispatch the final summary to Telegram
     if TELEGRAM_BOT_TOKEN:
-        requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": digest, "parse_mode": "HTML"}, timeout=8)
+        try:
+            requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": digest_msg, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=8)
+        except Exception as e:
+            print(f"[Telegram Digest Error] {e}")
 
     process_youtube_interviews()
-    print(f"[{datetime.now()}] Execution finished in {round(duration, 1)}s.")
+    print(f"[{datetime.now()}] Execution finished successfully in {round(duration, 1)}s.")
 
 if __name__ == "__main__":
     main()
