@@ -499,19 +499,36 @@ def evaluate_with_gemini(prompt):
 # 7. TELEGRAM DISPATCHER (WITH QUICK LINKS)
 # ---------------------------------------------------------------------------
 def send_telegram_alert(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("\n[Telegram Output Preview]\n" + message)
+        return
     try:
-        requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=8)
-    except Exception as e: print(f"[Telegram Dispatch Error] {e}")
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",  # Switched to HTML to bulletproof links and formatting
+            "disable_web_page_preview": True
+        }
+        requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json=payload, timeout=8)
+    except Exception as e:
+        print(f"[Telegram Dispatch Error] {e}")
+
 
 def build_telegram_message(company, exchange, scrip_code, isin, market_data, audit, all_links):
-    status = audit['consensus_status']
-    if status == "SIEVE_1_PASS": banner = "🔍 *INITIAL RADAR: SIEVE 1 (FLASH) PASSED*"
-    elif status == "SIEVE_1_5_PASS": banner = "⚡ *EARLY RADAR: SIEVE 1.5 (QWEN) PASSED*"
-    elif status == "MODEL_DIVERGENCE": banner = "⚠️ *MODEL DIVERGENCE DETECTED*"
-    elif status == "SINGLE_MODEL_IGNORE": banner = "🚫 *FILTERED / LOW CONVICTION*"
-    elif audit.get('high_conviction'): banner = "🚨 *HIGH CONVICTION CATALYST*"
-    else: banner = "📢 *CORPORATE ACTION RE-RATING CATALYST*"
+    status = audit.get('consensus_status', 'NEUTRAL_MIX')
+
+    if status == "SIEVE_1_PASS":
+        banner = "🔍 <b>INITIAL RADAR: SIEVE 1 (FLASH) PASSED</b>"
+    elif status == "SIEVE_1_5_PASS":
+        banner = "⚡ <b>EARLY RADAR: SIEVE 1.5 (QWEN) PASSED</b>"
+    elif status == "MODEL_DIVERGENCE":
+        banner = "⚠️ <b>MODEL DIVERGENCE DETECTED</b>"
+    elif status == "SINGLE_MODEL_IGNORE":
+        banner = "🚫 <b>FILTERED / LOW CONVICTION (EARLY EXIT)</b>"
+    elif audit.get('high_conviction'):
+        banner = "🚨 <b>HIGH CONVICTION CATALYST CONCURRENCE</b>"
+    else:
+        banner = "📢 <b>CORPORATE ACTION RE-RATING CATALYST</b>"
 
     price_str = f"₹{market_data['price']}" if market_data['price'] > 0 else "₹0.0 (Data Feed Sync)"
 
@@ -520,7 +537,8 @@ def build_telegram_message(company, exchange, scrip_code, isin, market_data, aud
     if c_cat is not None: cat_scores.append(f"Claude: {c_cat}/10")
     if g_cat is not None: cat_scores.append(f"Gemini: {g_cat}/10")
     fs = audit.get('final_score', 'N/A')
-    cat_line = " | ".join(cat_scores) if cat_scores else (f"Score: {fs}/10" if isinstance(fs, (int, float)) else "Score: N/A")
+    cat_line = " | ".join(cat_scores) if cat_scores else (
+        f"Score: {fs}/10" if isinstance(fs, (int, float)) else "Score: N/A")
 
     c_comp, g_comp = audit.get('claude_company_score'), audit.get('gemini_company_score')
     comp_scores = []
@@ -533,23 +551,41 @@ def build_telegram_message(company, exchange, scrip_code, isin, market_data, aud
     tv_link = f"https://in.tradingview.com/chart/?symbol={tv_symbol}"
 
     msg = (
-        f"{banner}\n**Company:** {company}\n**{exchange}:** `{scrip_code}` | **ISIN:** `{isin}`\n"
-        f"**Price:** {price_str} | **20D Vol:** {market_data['vol_multiple']}x | **52W High:** {market_data['dist_52w_high']}%\n"
-        f"**Est. MktCap:** ₹{market_data.get('market_cap_cr', 0)} Cr\n"
+        f"{banner}\n"
+        f"<b>Company:</b> {company}\n"
+        f"<b>{exchange}:</b> <code>{scrip_code}</code> | <b>ISIN:</b> <code>{isin}</code>\n"
+        f"<b>Price:</b> {price_str} | <b>20D Vol:</b> {market_data['vol_multiple']}x | <b>52W High:</b> {market_data['dist_52w_high']}%\n"
+        f"<b>Est. MktCap:</b> ₹{market_data.get('market_cap_cr', 0)} Cr\n"
     )
 
     if status not in ["SIEVE_1_PASS", "SIEVE_1_5_PASS"]:
-        msg += f"**Consensus Status:** `{status}`\n\n🎯 **Catalyst Score:** {cat_line}\n🏢 **Company Quality:** {comp_line}\n"
+        msg += f"<b>Consensus Status:</b> <code>{status}</code>\n\n🎯 <b>Catalyst Score:</b> {cat_line}\n🏢 <b>Company Quality:</b> {comp_line}\n"
 
-    if status == "SIEVE_1_PASS": msg += f"\n🔍 *Sieve 1 Catalyst Reason:*\n{audit.get('claude_analysis', 'N/A')}\n"
-    elif status == "SIEVE_1_5_PASS": msg += f"\n🤖 *Qwen 2.5 Extracted Facts (Score {fs}/10):*\n{audit.get('claude_analysis', 'N/A')}\n"
+    # --- CASCADING REASONING TRAIL ---
+    # 1. Sieve 1 Reason
+    s1_reason = audit.get('sieve1_reason')
+    if s1_reason:
+        msg += f"\n🔍 <b>Sieve 1 (Flash Lite) Intake Rationale:</b>\n{s1_reason}\n"
+
+    # 2. Sieve 1.5 Qwen Summary
+    s15_summary = audit.get('sieve15_summary')
+    if s15_summary and status != "SIEVE_1_PASS":
+        msg += f"\n🤖 <b>Sieve 1.5 (Qwen 7B) Extracted Summary & Pre-Score ({audit.get('qwen_pre_score', 'N/A')}/10):</b>\n{s15_summary[:600]}...\n"
+
+    # 3. Sieve 2 Deep Dive Analysis
+    if status == "SIEVE_1_PASS":
+        msg += f"\n🔍 <i>Catalyst Reason:</i>\n{audit.get('claude_analysis', 'N/A')}\n"
+    elif status == "SIEVE_1_5_PASS":
+        msg += f"\n🤖 <i>Qwen Extracted Facts:</i>\n{audit.get('claude_analysis', 'N/A')}\n"
     else:
-        if audit.get('claude_analysis'): msg += f"\n🧠 *Claude Analysis:*\n{audit['claude_analysis']}\n"
-        if audit.get('gemini_analysis'): msg += f"\n🤖 *Gemini Analysis:*\n{audit['gemini_analysis']}\n"
+        if audit.get('claude_analysis'):
+            msg += f"\n🧠 <b>Claude Analysis:</b>\n{audit['claude_analysis']}\n"
+        if audit.get('gemini_analysis'):
+            msg += f"\n🤖 <b>Gemini Analysis:</b>\n{audit['gemini_analysis']}\n"
 
-    msg += f"\n🔗 **Quick Links:** [Screener.in]({screener_link}) | [TradingView Chart]({tv_link}) | " + " | ".join([f"[PDF {i + 1}]({link})" for i, link in enumerate(all_links)])
+    pdf_links_str = " | ".join([f'<a href="{link}">PDF {i + 1}</a>' for i, link in enumerate(all_links)])
+    msg += f"\n🔗 <b>Quick Links:</b> <a href=\"{screener_link}\">Screener.in</a> | <a href=\"{tv_link}\">TradingView</a> | {pdf_links_str}"
     return msg
-
 
 # ---------------------------------------------------------------------------
 # 8. STAGGERED PRIORITY WORKERS & FINALIZATION
@@ -569,8 +605,12 @@ def finalize_dual_evaluation(item, evals, market_data, raw_pdf_text):
 
     audit = {
         'consensus_status': consensus_status, 'final_score': final_score, 'high_conviction': is_high_conviction,
-        'claude_catalyst_score': c_cat, 'gemini_catalyst_score': g_cat, 'claude_company_score': c_comp, 'gemini_company_score': g_comp,
-        'claude_analysis': evals.get('claude_analysis', ''), 'gemini_analysis': evals.get('gemini_analysis', '')
+        'claude_catalyst_score': c_cat, 'gemini_catalyst_score': g_cat, 'claude_company_score': c_comp,
+        'gemini_company_score': g_comp,
+        'claude_analysis': evals.get('claude_analysis', ''), 'gemini_analysis': evals.get('gemini_analysis', ''),
+        'sieve1_reason': item.get('catalyst_reason'),
+        'sieve15_summary': item.get('qwen_summary'),
+        'qwen_pre_score': item.get('qwen_pre_score')
     }
 
     if PUBLISH_WHEN_SIEVE_PASSED <= 2.0 and final_score >= 6:
@@ -579,19 +619,28 @@ def finalize_dual_evaluation(item, evals, market_data, raw_pdf_text):
     log_permanent_ledger(item, market_data, evals, audit, raw_pdf_text)
     log_announcements_batch([(att_id, item['company'], item['headline'], "HIT") for att_id in item['all_ids']])
 
+
 def finalize_single_model_ignore(item, evals, market_data, source_model, raw_pdf_text):
     score = evals.get(f'{source_model.lower()}_catalyst_score', 1)
-    print(f" -> [{source_model.upper()} Gatekeeper] Score {score}/10 < 5. Terminating Sieve 2 early for {item['company']}.")
+    print(
+        f" -> [{source_model.upper()} Gatekeeper] Score {score}/10 < 5. Terminating Sieve 2 early for {item['company']}.")
 
     audit = {
         'consensus_status': "SINGLE_MODEL_IGNORE", 'final_score': score, 'high_conviction': False,
-        'claude_catalyst_score': evals.get('claude_catalyst_score'), 'gemini_catalyst_score': evals.get('gemini_catalyst_score'),
-        'claude_company_score': evals.get('claude_company_score', 5), 'gemini_company_score': evals.get('gemini_company_score', 5),
-        'claude_analysis': evals.get('claude_analysis', ''), 'gemini_analysis': evals.get('gemini_analysis', '')
+        'claude_catalyst_score': evals.get('claude_catalyst_score'),
+        'gemini_catalyst_score': evals.get('gemini_catalyst_score'),
+        'claude_company_score': evals.get('claude_company_score', 5),
+        'gemini_company_score': evals.get('gemini_company_score', 5),
+        'claude_analysis': evals.get('claude_analysis', ''), 'gemini_analysis': evals.get('gemini_analysis', ''),
+        'sieve1_reason': item.get('catalyst_reason'),
+        'sieve15_summary': item.get('qwen_summary'),
+        'qwen_pre_score': item.get('qwen_pre_score')
     }
 
     if ALERT_ON_SINGLE_MODEL_IGNORE:
-        send_telegram_alert(build_telegram_message(item['company'], item['exchange'], item['scrip'], item['isin'], market_data, audit, item['all_links']))
+        send_telegram_alert(
+            build_telegram_message(item['company'], item['exchange'], item['scrip'], item['isin'], market_data, audit,
+                                   item['all_links']))
 
     log_announcements_batch([(att_id, item['company'], item['headline'], "IGNORE") for att_id in item['all_ids']])
 
