@@ -2,11 +2,11 @@
 Market Intelligence & Corporate Announcement Screening Engine (GitHub Actions Edition)
 =======================================================================================
 Architecture & Features:
-- Dynamic Payload Router: Intelligently switches between pypdf (10k chars) and pdfplumber (50k chars) based on headline context.
-- Full-PDF Passthrough: Qwen 2.5 7B acts as a fast gatekeeper (4.5k chars), while Sieve 2 gets the full raw text.
-- Peak Deluge Throttling: Thread-safe token bucket pacing prevents API 429 errors during earnings season.
-- Cascading Telegram Verbosity: Controlled via PUBLISH_WHEN_SIEVE_PASSED (1.0 = All, 1.5 = Sieve 1.5 + Sieve 2, 2.0 = Sieve 2 only, 100 = Max / Score > 5 only).
-- HTML Telegram Dispatcher: Fully HTML-escaped rich text with clickable Screener, TradingView, and PDF links.
+- State Machine Tracker: Defers all Telegram alerts to the end of the pipeline.
+- Cascading Verbosity (20, 40, 60, 1000): Dictates pipeline telemetry via Threshold Gatekeeper.
+- Sieve 20 (Flash Lite): Administrative Noise Gatekeeper.
+- Sieve 40 (Qwen 7B): Local Fluff/Pre-Score Gatekeeper (4.5k chars extraction).
+- Sieve 60 (Claude & Gemini): Deep Dive Consensus (Full 50k chars pdfplumber payload).
 """
 
 import os
@@ -36,17 +36,19 @@ except ImportError:
 from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
-# 0. LOGGING & SDK SUPPRESSION
+# 0. LOGGING & SDK CONFIGURATION
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# We suppress Google's internal API warnings so our console stays clean
 logging.getLogger("google").setLevel(logging.ERROR)
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION & ENVIRONMENT SETUP
+# 1. ENVIRONMENT & CLI ARGUMENT SETUP
 # ---------------------------------------------------------------------------
 load_dotenv()
 
+# Define the source URLs where we will scrape the data
 BSE_API_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno={page}&strCat=-1&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
 BSE_PDF_BASE_URL = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attachment}"
 NSE_BASE_URL = "https://www.nseindia.com"
@@ -56,6 +58,7 @@ YOUTUBE_RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
+# Headers make our Python script look like a real web browser to avoid getting blocked
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/pdf,*/*"
@@ -66,37 +69,37 @@ BSE_HEADERS = {
     "referer": "https://www.bseindia.com/"
 }
 NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/json",
     "Referer": "https://www.nseindia.com/"
 }
 
+# ---------------------------------------------------------------------------
+# VERBOSITY GATEKEEPER CONSTANT
+# 20   = Debug Mode: Sends alerts for everything (Sieve 20, 40, and 60 passes AND rejects)
+# 40   = Sends Sieve 40 and 60 results (Ignores the Sieve 20 noise)
+# 60   = Sends Sieve 60 results only (Passes and early exits)
+# 1000 = Production Mode: Sends ONLY fully passed Sieve 60 filings (Score >= 6)
+# ---------------------------------------------------------------------------
+VERBOSITY_LEVEL = float(os.getenv("VERBOSITY_LEVEL", "40.0"))
+
 DEFAULT_CHUNK_SIZE = 50
 DEFAULT_YOUTUBE_CHANNEL_ID = "UCb5hMTAFjG5j79V6nL3_YCQ"
+DEFAULT_MAX_SIEVE60 = int(os.getenv("MAX_SIEVE60_ITEMS", "0"))
+SIEVE_40_MIN_SCORE = int(os.getenv("SIEVE_40_MIN_SCORE", "5"))
 
-# Verbosity & Sieve Logic Thresholds
-# 1.0 = Pings for Sieve 1, Sieve 1.5, and Sieve 2
-# 1.5 = Pings for Sieve 1.5 + Sieve 2
-# 2.0 = Pings for Sieve 2 only
-# 100 = Max (Strict Sieve 2 passed results with score > 5 only)
-PUBLISH_WHEN_SIEVE_PASSED = float(os.getenv("PUBLISH_WHEN_SIEVE_PASSED", "1.5"))
-DEFAULT_MAX_SIEVE2 = int(os.getenv("MAX_SIEVE2_ITEMS", "0"))
-SIEVE_1_5_MIN_SCORE = int(os.getenv("SIEVE_1_5_MIN_SCORE", "5"))
-ALERT_ON_SINGLE_MODEL_IGNORE = os.getenv("ALERT_ON_SINGLE_MODEL_IGNORE", "false").lower() in ("true", "1", "yes")
-
-parser = argparse.ArgumentParser(description="Market Intelligence Screening Engine (GitHub Actions Edition)")
+# Parse command line arguments (like python script.py --ignore-cache)
+parser = argparse.ArgumentParser(description="Corporate Announcement Screening Engine")
 parser.add_argument("--ignore-cache", "-f", action="store_true", help="Bypass Supabase cache and re-evaluate all filings")
 parser.add_argument("--max-pages", type=int, default=100, help="Maximum BSE announcement pages to fetch")
-parser.add_argument("--max-sieve2", type=int, default=DEFAULT_MAX_SIEVE2, help="Max candidates sent to Sieve 2 (0 for all)")
+parser.add_argument("--max-sieve60", type=int, default=DEFAULT_MAX_SIEVE60, help="Max candidates sent to Sieve 60")
 args, _ = parser.parse_known_args()
 
 IGNORE_CACHE = args.ignore_cache or os.getenv("IGNORE_CACHE", "false").lower() in ("true", "1", "yes")
 
-USE_LOCAL_EXTRACTOR = os.getenv("USE_LOCAL_EXTRACTOR", "true").lower() in ("true", "1", "yes")
+# Pull API Keys from .env file
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", DEFAULT_OLLAMA_URL)
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY_PAID") or os.getenv("GEMINI_API_KEY_FREE")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -107,15 +110,18 @@ TIER1_MODEL = os.getenv("GEMINI_TIER1_MODEL", "gemini-3.5-flash-lite")
 TIER2_GEMINI_MODEL = os.getenv("GEMINI_TIER2_MODEL", "gemini-3.1-pro-preview")
 TIER2_CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 
+# Initialize Cloud AI clients
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# Throttling Locks
+# Threading locks to prevent APIs from being overwhelmed when running in parallel
 api_lock = threading.Lock()
+master_list_lock = threading.Lock()
 last_api_call = 0.0
 MIN_API_DELAY = 1.5
 
 def throttle_api():
+    """[ROUTING] Forces a 1.5-second pause between heavy API calls to avoid 429 Too Many Requests errors."""
     global last_api_call
     with api_lock:
         now = time.time()
@@ -124,9 +130,8 @@ def throttle_api():
             time.sleep(MIN_API_DELAY - elapsed)
         last_api_call = time.time()
 
-
 # ---------------------------------------------------------------------------
-# 2. SUPABASE DATABASE LAYER
+# 2. DATABASE / LEDGER CACHE
 # ---------------------------------------------------------------------------
 def get_db_connection():
     if not SUPABASE_URL: return None
@@ -136,6 +141,7 @@ def get_db_connection():
         return None
 
 def filter_unprocessed_announcements(filings):
+    """[DECISION] Queries the DB. If the filing ID already exists, we drop it to avoid re-evaluating old news."""
     if IGNORE_CACHE: return filings
     conn = get_db_connection()
     if not conn: return filings
@@ -144,16 +150,21 @@ def filter_unprocessed_announcements(filings):
         attachments = [item['id'] for item in filings if item.get('id')]
         if not attachments:
             conn.close(); return []
+
+        # Create a dynamic SQL query based on how many attachments we have
         query = f"SELECT bse_attachment_name FROM bse_announcements WHERE bse_attachment_name IN ({','.join(['%s'] * len(attachments))})"
         cursor.execute(query, tuple(attachments))
         existing = {row[0] for row in cursor.fetchall()}
         conn.close()
+
+        # Keep only the items that were NOT found in the database
         return [item for item in filings if item['id'] not in existing]
     except Exception as e:
         print(f"[Database Error] Deduplication query failed: {e}")
         return filings
 
 def group_filings_by_company(filings):
+    """[DECISION] If a company releases 3 PDFs at the same time, we merge them into 1 master record here."""
     grouped = {}
     for item in filings:
         key = (item['exchange'], item['scrip'])
@@ -164,6 +175,7 @@ def group_filings_by_company(filings):
                 'all_links': [item['link']], 'exchange': item['exchange']
             }
         else:
+            # Combine the headlines and links of subsequent filings into the first one
             existing = grouped[key]
             if item['id'] not in existing['all_ids']: existing['all_ids'].append(item['id'])
             if item['headline'] not in existing['headline']: existing['headline'] += f" | {item['headline']}"
@@ -171,6 +183,7 @@ def group_filings_by_company(filings):
     return list(grouped.values())
 
 def log_announcements_batch(decisions_list):
+    """Saves basic triage decisions (HIT/IGNORE) so we don't process them again for 7 days."""
     if not decisions_list: return
     conn = get_db_connection()
     if not conn: return
@@ -179,12 +192,11 @@ def log_announcements_batch(decisions_list):
         query = """INSERT INTO bse_announcements (bse_attachment_name, company_name, headline, ai_decision) 
                    VALUES (%s, %s, %s, %s) ON CONFLICT (bse_attachment_name) DO UPDATE SET ai_decision = EXCLUDED.ai_decision"""
         cursor.executemany(query, decisions_list)
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"[Database Error] Batch cache insertion failed: {e}")
+        conn.commit(); conn.close()
+    except Exception: pass
 
-def log_permanent_ledger(item, market_data, evals, audit, extracted_text):
+def log_permanent_ledger(item, market_data):
+    """Saves the massive, deep-dive AI analysis into our permanent historical tracker."""
     conn = get_db_connection()
     if not conn: return
     try:
@@ -203,28 +215,24 @@ def log_permanent_ledger(item, market_data, evals, audit, extracted_text):
         """
         cursor.execute(query, (
             item['id'], item['company'], item['scrip'], item['exchange'], item.get('isin', 'N/A'),
-            item.get('headline', ''), item.get('catalyst_reason', 'Actionable corporate action'),
+            item.get('headline', ''), item.get('sieve20_reason', 'Actionable corporate action'),
             market_data.get('price', 0.0), market_data.get('market_cap_cr', 0.0), market_data.get('vol_multiple', 1.0),
             market_data.get('above_50dma', False), market_data.get('above_200dma', False),
-            audit.get('final_score', 1), audit.get('consensus_status', 'NEUTRAL_MIX'), audit.get('high_conviction', False),
-            audit.get('claude_catalyst_score'), audit.get('gemini_catalyst_score'),
-            audit.get('claude_company_score'), audit.get('gemini_company_score'),
-            extracted_text, evals.get('claude_analysis', ''), evals.get('gemini_analysis', '')
+            item.get('final_score', 1), item.get('status', 'NEUTRAL_MIX'), item.get('high_conviction', False),
+            item.get('sieve60_claude_score'), item.get('sieve60_gemini_score'),
+            item.get('sieve60_claude_company'), item.get('sieve60_gemini_company'),
+            item.get('sieve40_summary', ''), item.get('sieve60_claude_analysis', ''), item.get('sieve60_gemini_analysis', '')
         ))
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
     except Exception as e:
         print(f"[Database Error] Comprehensive ledger logging failed: {e}")
 
-
 # ---------------------------------------------------------------------------
-# 3. QUANT METRICS & SCUTTLEBUTT CONTEXT
+# 3. METRICS & EXTRACTION ROUTER
 # ---------------------------------------------------------------------------
 def fetch_market_metrics(scrip_code, exchange):
-    default_payload = {
-        "price": 0.0, "vol_multiple": 1.0, "above_50dma": False, "above_200dma": False,
-        "dist_52w_high": 0.0, "price_feed_sync": True, "market_cap_cr": 0.0
-    }
+    """Calculates stock price, 20-day volume surge, and moving averages using Yahoo Finance."""
+    default_payload = {"price": 0.0, "vol_multiple": 1.0, "above_50dma": False, "above_200dma": False, "dist_52w_high": 0.0, "market_cap_cr": 0.0}
     if not scrip_code: return default_payload
     try:
         ticker = f"{scrip_code}.NS" if exchange == "NSE" else f"{scrip_code}.BO"
@@ -233,72 +241,45 @@ def fetch_market_metrics(scrip_code, exchange):
         if hist.empty or len(hist) < 20: return default_payload
 
         current_price = round(float(hist['Close'].iloc[-1]), 2)
+
+        # [CALCULATION] Compare today's volume to the average of the last 20 days
         avg_20_volume = float(hist['Volume'].iloc[-21:-1].mean()) if len(hist) >= 21 else float(hist['Volume'].iloc[-1])
         vol_multiple = round((float(hist['Volume'].iloc[-1]) / avg_20_volume), 2) if avg_20_volume > 0 else 1.0
 
         dma_50 = hist['Close'].rolling(window=50).mean().iloc[-1] if len(hist) >= 50 else current_price
         dma_200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) >= 200 else current_price
         high_52w = float(hist['High'].max())
+
+        # [CALCULATION] How far away is the stock from its 52-week peak?
         dist_52w_high = round(((current_price - high_52w) / high_52w) * 100, 1) if high_52w > 0 else 0.0
 
-        market_cap_cr = 0.0
-        try:
-            mkt_cap = getattr(stock.fast_info, 'market_cap', 0)
-            if mkt_cap: market_cap_cr = round(mkt_cap / 1e7, 2)
-        except Exception: pass
-
-        return {
-            "price": current_price, "vol_multiple": vol_multiple,
-            "above_50dma": bool(current_price > dma_50), "above_200dma": bool(current_price > dma_200),
-            "dist_52w_high": dist_52w_high, "price_feed_sync": bool(current_price == 0.0), "market_cap_cr": market_cap_cr
-        }
-    except Exception as e:
-        print(f"[Market Data Notice] Scrip {scrip_code} ({exchange}): {e}")
-        return default_payload
-
-def fetch_valuepickr_sentiment(company_name):
-    try:
-        clean_name = company_name.split()[0].replace("Ltd", "").strip()
-        res = requests.get(VALUEPICKR_API_URL.format(term=clean_name), headers=DEFAULT_HEADERS, timeout=5)
-        if res.status_code != 200: return "No active forum discussion found."
-        posts = res.json().get('posts', [])
-        return " ".join([p.get('blurb', '') for p in posts[:5]])[:1500] if posts else "No active forum discussion found."
-    except Exception: return "Forum search bypassed."
-
-
-# ---------------------------------------------------------------------------
-# 4. DYNAMIC PAYLOAD ROUTER (PDF EXTRACTION)
-# ---------------------------------------------------------------------------
-def sanitize_filing_text(text):
-    if not text: return ""
-    match = re.search(r'(?i)(?:Sub(?:ject)?\s*:|Ref\s*:)', text)
-    if match: text = text[match.start():]
-    text = re.sub(r'(?i)(?:\bDisclaimer\b|CAREEDGE RATINGS DISCLAIMS|S&P Global Ratings Terms and Conditions).*$', '', text, flags=re.DOTALL)
-    text = re.sub(r'\n{2,}', '\n', text)
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r'[^\x00-\x7F₹]+', '', text)
-    return text.strip()
+        market_cap_cr = round(getattr(stock.fast_info, 'market_cap', 0) / 1e7, 2)
+        return {"price": current_price, "vol_multiple": vol_multiple, "above_50dma": bool(current_price > dma_50), "above_200dma": bool(current_price > dma_200), "dist_52w_high": dist_52w_high, "market_cap_cr": market_cap_cr}
+    except Exception: return default_payload
 
 def extract_text_from_pdf_url(pdf_url, headline):
-    if not pdf_url or not pdf_url.startswith("http"):
-        return "No valid PDF URL provided."
-
+    """
+    [DECISION: DYNAMIC ROUTER]
+    If the headline mentions financials/earnings, we fire up pdfplumber to extract 50,000 characters and 15 pages.
+    Otherwise, we use lightweight pypdf to just grab the first 10,000 characters to keep things fast.
+    """
+    if not pdf_url or not pdf_url.startswith("http"): return "No valid PDF URL."
     headline_lower = headline.lower()
     financial_keywords = ["financial result", "outcome of board meeting", "earnings", "annual report", "financial statement"]
     is_heavy_financial = any(kw in headline_lower for kw in financial_keywords)
 
-    max_pages = 15 if is_heavy_financial else 4
-    max_chars = 50000 if is_heavy_financial else 10000
+    max_pages, max_chars = (15, 50000) if is_heavy_financial else (4, 10000)
 
     try:
-        response = requests.get(pdf_url, headers=DEFAULT_HEADERS, timeout=15)
-        if response.status_code == 200:
-            with io.BytesIO(response.content) as pdf_buffer:
+        res = requests.get(pdf_url, headers=DEFAULT_HEADERS, timeout=15)
+        if res.status_code == 200:
+            with io.BytesIO(res.content) as pdf_buffer:
                 if is_heavy_financial and pdfplumber:
                     extracted_pages = []
                     with pdfplumber.open(pdf_buffer) as pdf:
                         for i, page in enumerate(pdf.pages):
                             if i >= max_pages: break
+                            # layout=True keeps financial tables in their correct columns
                             text = page.extract_text(layout=True) or page.extract_text()
                             if text: extracted_pages.append(text)
                     raw_text = "\n".join(extracted_pages)
@@ -306,13 +287,15 @@ def extract_text_from_pdf_url(pdf_url, headline):
                     reader = PdfReader(pdf_buffer)
                     raw_text = "\n".join([page.extract_text() for page in reader.pages[:max_pages] if page.extract_text()])
 
-                clean_text = sanitize_filing_text(raw_text)
-                return clean_text[:max_chars] if clean_text else "PDF contains scanned imagery or unextractable text."
-        return f"Failed to download PDF (HTTP {response.status_code})"
-    except Exception as e:
-        return f"PDF extraction error: {e}"
+                # Clean up boilerplate disclaimers
+                text = re.sub(r'(?i)(?:\bDisclaimer\b|CAREEDGE RATINGS DISCLAIMS).*$', '', raw_text, flags=re.DOTALL)
+                clean_text = re.sub(r'[ \t]+', ' ', re.sub(r'\n{2,}', '\n', re.sub(r'[^\x00-\x7F₹]+', '', text))).strip()
+                return clean_text[:max_chars] if clean_text else "Unextractable text."
+        return f"Failed to download PDF ({res.status_code})"
+    except Exception as e: return f"PDF error: {e}"
 
 def extract_score(text, label):
+    """Helper function to find a score like 'Catalyst Score: 8/10' inside AI text."""
     if not text: return None
     for line in text.splitlines():
         if label.lower() in line.lower():
@@ -322,462 +305,333 @@ def extract_score(text, label):
             if digits: return int(digits[0])
     return None
 
-
 # ---------------------------------------------------------------------------
-# 5. SIEVE 1 (FLASH LITE) & SIEVE 1.5 (LOCAL QWEN 2.5)
+# 4. SIEVES 20, 40, 60 LOGIC (STATE TRACKERS)
 # ---------------------------------------------------------------------------
-def run_tier1_batch_sieve(announcements):
-    if not announcements or not gemini_client:
-        return announcements, []
+def run_sieve20_batch(announcements, master_results):
+    """
+    SIEVE 20: Reads just the headline of 50 filings at once using fast Gemini Flash.
+    Any routine noise (newspaper clippings, lost shares) gets rejected immediately.
+    """
+    if not announcements or not gemini_client: return []
+    hits = []
 
-    hits, rejections = [], []
     for i in range(0, len(announcements), DEFAULT_CHUNK_SIZE):
         chunk = announcements[i:i + DEFAULT_CHUNK_SIZE]
         items_payload = [{"index": idx, "exchange": a['exchange'], "scrip": a['scrip'], "company": a['company'], "headline": a['headline']} for idx, a in enumerate(chunk)]
 
-        prompt = f"""
-        You are an objective exchange filing intake filter. Categorize EACH announcement as either "HIT" or "REJECT".
+        prompt = f"""You are an objective exchange filing intake filter. Categorize EACH announcement as either "HIT" or "REJECT".
+        HIGH-MATERIALITY CATALYSTS (HIT): Financial Results, Commercial Orders, Fundraisings/M&A, Rating Upgrades, Capex, Deleveraging, FDA Clearances.
+        CRITICAL EXCLUSIONS (REJECT): Loss of shares, trading window closures, meeting intimations, shareholding patterns, ESOPs, newspaper clippings.
+        Respond with ONLY a valid JSON array. Announcements: {json.dumps(items_payload, indent=2)}"""
 
-        HIGH-MATERIALITY CATALYSTS (FLAG AS "HIT"):
-        1. Financial Results & Guidance (Quarterly/annual statements, revenue/margin guidance updates).
-        2. Commercial Order Wins & Contract Awards (Defense, Railways, OEM agreements, LoA).
-        3. Fundraisings & M&A (Preferential allotments, strategic warrants, QIP, acquisitions, demergers, open offers).
-        4. Credit Rating Actions (Upgrades or major revisions).
-        5. Capex & Commercial Production (Commissioning of new plants, capacity expansions).
-        6. Balance Sheet Deleveraging (Prepayments, net debt-free milestones, one-time settlements).
-        7. Regulatory Clearances (USFDA EIR/approvals, CDSCO, PLI scheme subsidies, patent grants).
-
-        CRITICAL EXCLUSIONS (FLAG AS "REJECT"):
-        - Loss of share certificates / duplicate requests (Reg 39(3)).
-        - Trading window closure notices for board meetings / financial results.
-        - Advance intimations of Board Meeting dates (prior notices).
-        - Routine shareholding patterns (Reg 31), Corporate Governance (Reg 27(2)), Secretarial Compliance (Reg 24A).
-        - Newspaper publication clippings, routine ESOP allotments.
-
-        Respond with ONLY a valid JSON array of objects in this exact structure:
-        [
-          {{"index": 0, "status": "HIT", "reason": "Commercial contract win of INR 250 Cr"}},
-          {{"index": 1, "status": "REJECT", "reason": "Trading window closure notice"}}
-        ]
-
-        Announcements to screen:
-        {json.dumps(items_payload, indent=2)}
-        """
         for attempt in range(3):
             try:
                 response = gemini_client.models.generate_content(model=TIER1_MODEL, contents=prompt)
-                parsed_decisions = json.loads(response.text.strip().replace("```json", "").replace("```", ""))
-                for dec in parsed_decisions:
+                parsed = json.loads(response.text.strip().replace("```json", "").replace("```", ""))
+                for dec in parsed:
                     idx = dec.get("index")
                     if idx is not None and idx < len(chunk):
                         ann_item = chunk[idx]
                         status, reason = dec.get("status", "REJECT").upper(), dec.get("reason", "Routine filing")
+                        ann_item["sieve20_reason"] = reason
+
                         if status == "HIT":
-                            ann_item["catalyst_reason"] = reason
                             hits.append(ann_item)
-                            print(f" [SIEVE 1 HIT] {ann_item['company']} | {reason}")
                         else:
-                            ann_item["rejection_reason"] = reason
-                            rejections.append(ann_item)
-                            print(f" [SIEVE 1 REJECT] {ann_item['company']} | {reason}")
+                            # [STATE UPDATE] Document died at Sieve 20. Mark terminal stage and save to master list.
+                            ann_item["terminal_stage"] = 20
+                            ann_item["status"] = "REJECTED_SIEVE20"
+                            master_results.append(ann_item)
                 break
             except Exception as e:
-                if "503" in str(e) or "429" in str(e) or "quota" in str(e): time.sleep(2 ** attempt); continue
-                print(f"[Tier 1 Error] Chunk evaluation failed: {e}. Defaulting chunk to HIT.")
+                if "503" in str(e) or "429" in str(e): time.sleep(2 ** attempt); continue
+                print(f"[Sieve 20 Error] Chunk failed: {e}. Defaulting to HIT.")
                 hits.extend(chunk); break
+    return hits
 
-    return hits, rejections
+def run_sieve40_extraction(item):
+    """
+    SIEVE 40: Downloads the PDF, extracts text, and uses local Qwen to score it.
+    If it's marketing fluff disguised as a contract, Qwen will score it low and kill it here.
+    """
+    text = extract_text_from_pdf_url(item['all_links'][0] if item.get('all_links') else item.get('link', ''), item['headline'])
+    item['raw_pdf_text'] = text
 
+    # [DECISION] We only pass the first 4,500 chars to local Qwen to save CPU cycles.
+    if not text or len(text) < 80:
+        item['sieve40_summary'], item['sieve40_score'] = "No local extraction.", 5
+        return item
 
-def sieve_1_5_local_qwen_extraction(cleaned_pdf_text, headline):
-    if not USE_LOCAL_EXTRACTOR or not cleaned_pdf_text or len(cleaned_pdf_text) < 80:
-        return "No local extraction.", 5
-
-    prompt = f"""
-    You are a strict financial analyst pre-screening corporate disclosures.
-    Extract key facts and assign an objective PreScore from 1 to 10 based on concrete economic materiality.
-
-    CRITICAL SCORING RULES:
-    - Score 1 to 4: Trade expo, PR marketing, non-binding MoUs, minor updates.
-    - Score 5 to 6: Small/routine purchase orders, incremental business progress.
-    - Score 7 to 10: Hard confirmed contract wins (>INR 50 Cr+), net-debt reduction, major capex commissioning, or strong financial beats.
-
-    Document Text:
-    Headline: {headline}
-    Filing Body:
-    {cleaned_pdf_text[:4500]}
-
-    Output format:
-    Summary: [150-word tight summary of the core trigger event]
-    Value: [Exact deal value or financial figure]
-    Client: [Entity name or domestic/international status]
-    PreScore: [Strictly an integer from 1 to 10, e.g., 7/10]
-    """.strip()
+    prompt = f"""Extract key facts and assign a PreScore (1 to 10).
+    Score 1-4: Trade expo, generic PR, minor updates.
+    Score 5-6: Small/routine purchase orders, incremental progress.
+    Score 7-10: Hard confirmed wins (>50Cr), net-debt reduction, major capex, strong financial beats.
+    Document Text: {item['headline']}\n{text[:4500]}\nOutput format:\nSummary: [150 words]\nValue: [Exact value]\nClient: [Entity]\nPreScore: [Integer 1-10]"""
 
     try:
         res = requests.post(OLLAMA_API_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}}, timeout=90)
         if res.status_code == 200:
-            extracted_output = res.json().get("response", "").strip()
-            if extracted_output:
-                pre_score = extract_score(extracted_output, "PreScore:")
-                return extracted_output, (pre_score if pre_score is not None else 5)
-    except Exception as e:
-        print(f" [Sieve 1.5 Warning] Qwen inference bypassed ({e}).")
-    return "Local inference failed.", 5
+            extracted = res.json().get("response", "").strip()
+            score_match = re.search(r'PreScore.*?(\b10|[1-9])\b', extracted, re.IGNORECASE)
+            item['sieve40_score'] = int(score_match.group(1)) if score_match else 5
+            item['sieve40_summary'] = extracted
+            return item
+    except Exception: pass
+    item['sieve40_summary'], item['sieve40_score'] = "Local inference failed.", 5
+    return item
 
+def build_sieve60_prompt(item, market_data, forum_text):
+    return f"""Assess how strongly this event will impact future earnings power. Disregard market cap (evaluate proportional impact).
+    Company: {item['company']} | Price: {market_data['price']} | 20D Vol: {market_data['vol_multiple']}x | 52W High Dist: {market_data['dist_52w_high']}%
+    Headline: {item['headline']} | Forum Context: {forum_text}
+    Pre-Screen: {item.get('sieve40_summary','')}
+    Raw Document: {item.get('raw_pdf_text','')}
+    OUTPUT FORMAT:
+    Reasoning: <2-3 sentences on commercial impact>
+    Catalyst Score: <Integer 1-10>
+    Company Quality Score: <Integer 1-10>"""
 
-# ---------------------------------------------------------------------------
-# 6. TIER 2 (SIEVE 2): RAW PASSTHROUGH TO CLAUDE & GEMINI
-# ---------------------------------------------------------------------------
-def build_sieve2_prompt(item, market_data, forum_text, raw_pdf_text, qwen_summary):
-    price_display = f"INR {market_data['price']}" if market_data['price'] > 0 else "Data Feed Sync"
-    mkt_cap_display = f"INR {market_data['market_cap_cr']} Cr" if market_data.get('market_cap_cr', 0) > 0 else "Not specified"
-
-    return f"""You are an institutional equity research analyst evaluating corporate exchange filings.
-Assess how strongly this event will impact the company's future earnings power, business trajectory, and institutional market re-rating.
-
-EVALUATION PRINCIPLES:
-- Disregard market cap. Evaluate the PROPORTIONAL impact of the event on the company's business scale.
-- Base your analysis on both the extracted summary and the FULL raw document below.
-
-COMPANY DETAILS:
-Company: {item['company']} ({item['exchange']}: {item['scrip']} | ISIN: {item['isin']})
-Price: {price_display} | 20D Vol: {market_data['vol_multiple']}x | 52W High Dist: {market_data['dist_52w_high']}% | MktCap: {mkt_cap_display}
-Headline: {item['headline']}
-Flagged Catalyst: {item.get('catalyst_reason', 'Actionable corporate action')}
-Forum Context: {forum_text}
-
-==================== PRE-SCREENER SUMMARY ====================
-{qwen_summary}
-
-==================== FULL RAW REGULATORY FILING ====================
-{raw_pdf_text}
-======================================================================
-
-OUTPUT FORMAT:
-Reasoning: <2-3 sentences on proportional commercial impact, execution capability, and market re-rating probability>
-Hype / Red Flag Check: <Clean / Warning flags>
-Catalyst Score: <Strictly an integer from 1 to 10, e.g., 8/10>
-Company Quality Score: <Strictly an integer from 1 to 10 evaluating core business franchise durability>
-"""
-
-
-def evaluate_with_claude(prompt):
-    if not claude_client: return "Claude evaluation skipped: API key missing."
-    for attempt in range(3):
-        throttle_api()
-        try:
-            res = claude_client.messages.create(model=TIER2_CLAUDE_MODEL, max_tokens=500, messages=[{"role": "user", "content": prompt}])
-            text_blocks = [b.text for b in res.content if getattr(b, "type", None) == "text"]
-            return "\n".join(text_blocks).strip() if text_blocks else "Claude returned no text."
-        except Exception as e:
-            if "503" in str(e) or "429" in str(e) or "overloaded" in str(e): time.sleep(2 ** attempt); continue
-            return f"Claude analysis error: {e}"
-    return "Claude analysis error: API unavailable after retries."
-
-
-def evaluate_with_gemini(prompt):
-    if not gemini_client: return "Gemini Pro evaluation skipped: API key missing."
-    for attempt in range(3):
-        throttle_api()
-        try:
-            res = gemini_client.models.generate_content(model=TIER2_GEMINI_MODEL, contents=prompt)
-            return res.text.strip()
-        except Exception as e:
-            if "503" in str(e) or "429" in str(e) or "quota" in str(e): time.sleep(2 ** attempt); continue
-            return f"Gemini Pro analysis error: {e}"
-    return "Gemini Pro analysis error: API unavailable after retries."
-
-
-# ---------------------------------------------------------------------------
-# 7. TELEGRAM DISPATCHER (HTML MODE + CASCADING RATIONALE)
-# ---------------------------------------------------------------------------
-def send_telegram_alert(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("\n[Telegram Output Preview]\n" + message)
-        return
-    try:
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json=payload, timeout=8)
-    except Exception as e:
-        print(f"[Telegram Dispatch Error] {e}")
-
-
-def build_telegram_message(company, exchange, scrip_code, isin, market_data, audit, all_links):
-    status = audit.get('consensus_status', 'NEUTRAL_MIX')
-
-    if status == "SIEVE_1_PASS": banner = "🔍 <b>INITIAL RADAR: SIEVE 1 (FLASH) PASSED</b>"
-    elif status == "SIEVE_1_5_PASS": banner = "⚡ <b>EARLY RADAR: SIEVE 1.5 (QWEN) PASSED</b>"
-    elif status == "MODEL_DIVERGENCE": banner = "⚠️ <b>MODEL DIVERGENCE DETECTED</b>"
-    elif status == "SINGLE_MODEL_IGNORE": banner = "🚫 <b>FILTERED / LOW CONVICTION (EARLY EXIT)</b>"
-    elif audit.get('high_conviction'): banner = "🚨 <b>HIGH CONVICTION CATALYST CONCURRENCE</b>"
-    else: banner = "📢 <b>CORPORATE ACTION RE-RATING CATALYST</b>"
-
-    price_str = f"₹{market_data['price']}" if market_data['price'] > 0 else "₹0.0 (Data Feed Sync)"
-
-    c_cat, g_cat = audit.get('claude_catalyst_score'), audit.get('gemini_catalyst_score')
-    cat_scores = []
-    if c_cat is not None: cat_scores.append(f"Claude: {c_cat}/10")
-    if g_cat is not None: cat_scores.append(f"Gemini: {g_cat}/10")
-    fs = audit.get('final_score', 'N/A')
-    cat_line = " | ".join(cat_scores) if cat_scores else (f"Score: {fs}/10" if isinstance(fs, (int, float)) else "Score: N/A")
-
-    c_comp, g_comp = audit.get('claude_company_score'), audit.get('gemini_company_score')
-    comp_scores = []
-    if c_comp is not None: comp_scores.append(f"Claude: {c_comp}/10")
-    if g_comp is not None: comp_scores.append(f"Gemini: {g_comp}/10")
-    comp_line = " | ".join(comp_scores) if comp_scores else "N/A"
-
-    screener_link = f"https://www.screener.in/company/{scrip_code}/"
-    tv_symbol = f"NSE:{scrip_code}" if exchange == "NSE" else f"BSE:{scrip_code}"
-    tv_link = f"https://in.tradingview.com/chart/?symbol={tv_symbol}"
-
-    msg = (
-        f"{banner}\n"
-        f"<b>Company:</b> {company}\n"
-        f"<b>{exchange}:</b> <code>{scrip_code}</code> | <b>ISIN:</b> <code>{isin}</code>\n"
-        f"<b>Price:</b> {price_str} | <b>20D Vol:</b> {market_data['vol_multiple']}x | <b>52W High:</b> {market_data['dist_52w_high']}%\n"
-        f"<b>Est. MktCap:</b> ₹{market_data.get('market_cap_cr', 0)} Cr\n"
-    )
-
-    if status not in ["SIEVE_1_PASS", "SIEVE_1_5_PASS"]:
-        msg += f"<b>Consensus Status:</b> <code>{status}</code>\n\n🎯 <b>Catalyst Score:</b> {cat_line}\n🏢 <b>Company Quality:</b> {comp_line}\n"
-
-    # --- CASCADING RATIONALE TRAIL ---
-    s1_reason = audit.get('sieve1_reason')
-    if s1_reason:
-        msg += f"\n🔍 <b>Sieve 1 (Flash Lite) Intake Rationale:</b>\n{s1_reason}\n"
-
-    s15_summary = audit.get('sieve15_summary')
-    if s15_summary and status != "SIEVE_1_PASS":
-        msg += f"\n🤖 <b>Sieve 1.5 (Qwen 7B) Extracted Summary & Pre-Score ({audit.get('qwen_pre_score', 'N/A')}/10):</b>\n{s15_summary[:600]}...\n"
-
-    if status == "SIEVE_1_PASS":
-        msg += f"\n🔍 <i>Catalyst Reason:</i>\n{audit.get('claude_analysis', 'N/A')}\n"
-    elif status == "SIEVE_1_5_PASS":
-        msg += f"\n🤖 <i>Qwen Extracted Facts:</i>\n{audit.get('claude_analysis', 'N/A')}\n"
-    else:
-        if audit.get('claude_analysis'):
-            msg += f"\n🧠 <b>Claude Analysis:</b>\n{audit['claude_analysis']}\n"
-        if audit.get('gemini_analysis'):
-            msg += f"\n🤖 <b>Gemini Analysis:</b>\n{audit['gemini_analysis']}\n"
-
-    pdf_links_str = " | ".join([f'<a href="{link}">PDF {i + 1}</a>' for i, link in enumerate(all_links)])
-    msg += f"\n🔗 <b>Quick Links:</b> <a href=\"{screener_link}\">Screener.in</a> | <a href=\"{tv_link}\">TradingView</a> | {pdf_links_str}"
-    return msg
-
-
-# ---------------------------------------------------------------------------
-# 8. STAGGERED PRIORITY WORKERS & FINALIZATION
-# ---------------------------------------------------------------------------
-def finalize_dual_evaluation(item, evals, market_data, raw_pdf_text):
-    c_cat, g_cat = evals.get('claude_catalyst_score', 1), evals.get('gemini_catalyst_score', 1)
-    c_comp, g_comp = evals.get('claude_company_score', 5), evals.get('gemini_company_score', 5)
-
-    is_divergent = (abs(c_cat - g_cat) >= 4 or (c_cat >= 7 and g_cat <= 4) or (g_cat >= 7 and c_cat <= 4))
-    if is_divergent: consensus_status = "MODEL_DIVERGENCE"
-    elif c_cat >= 7 and g_cat >= 7: consensus_status = "CONSENSUS_HIT"
-    elif c_cat <= 4 and g_cat <= 4: consensus_status = "CONSENSUS_IGNORE"
-    else: consensus_status = "NEUTRAL_MIX"
-
-    final_score = round((c_cat + g_cat) / 2)
-    is_high_conviction = (final_score >= 8 and market_data['vol_multiple'] >= 2.0 and market_data['above_50dma'])
-
-    audit = {
-        'consensus_status': consensus_status, 'final_score': final_score, 'high_conviction': is_high_conviction,
-        'claude_catalyst_score': c_cat, 'gemini_catalyst_score': g_cat, 'claude_company_score': c_comp, 'gemini_company_score': g_comp,
-        'claude_analysis': evals.get('claude_analysis', ''), 'gemini_analysis': evals.get('gemini_analysis', ''),
-        'sieve1_reason': item.get('catalyst_reason'),
-        'sieve15_summary': item.get('qwen_summary'),
-        'qwen_pre_score': item.get('qwen_pre_score')
-    }
-
-    # Publishing threshold check:
-    # PUBLISH_WHEN_SIEVE_PASSED <= 2.0: Publishes Sieve 2 results
-    # PUBLISH_WHEN_SIEVE_PASSED >= 100: Publishes Sieve 2 passed results with score > 5 (i.e. >= 6) only
-    should_publish = False
-    if PUBLISH_WHEN_SIEVE_PASSED <= 2.0:
-        should_publish = True
-    elif PUBLISH_WHEN_SIEVE_PASSED >= 100:
-        if final_score >= 6:
-            should_publish = True
-
-    if should_publish:
-        send_telegram_alert(build_telegram_message(item['company'], item['exchange'], item['scrip'], item['isin'], market_data, audit, item['all_links']))
-
-    log_permanent_ledger(item, market_data, evals, audit, raw_pdf_text)
-    log_announcements_batch([(att_id, item['company'], item['headline'], "HIT") for att_id in item['all_ids']])
-
-def finalize_single_model_ignore(item, evals, market_data, source_model, raw_pdf_text):
-    score = evals.get(f'{source_model.lower()}_catalyst_score', 1)
-    print(f" -> [{source_model.upper()} Gatekeeper] Score {score}/10 < 5. Terminating Sieve 2 early for {item['company']}.")
-
-    audit = {
-        'consensus_status': "SINGLE_MODEL_IGNORE", 'final_score': score, 'high_conviction': False,
-        'claude_catalyst_score': evals.get('claude_catalyst_score'), 'gemini_catalyst_score': evals.get('gemini_catalyst_score'),
-        'claude_company_score': evals.get('claude_company_score', 5), 'gemini_company_score': evals.get('gemini_company_score', 5),
-        'claude_analysis': evals.get('claude_analysis', ''), 'gemini_analysis': evals.get('gemini_analysis', ''),
-        'sieve1_reason': item.get('catalyst_reason'),
-        'sieve15_summary': item.get('qwen_summary'),
-        'qwen_pre_score': item.get('qwen_pre_score')
-    }
-
-    if ALERT_ON_SINGLE_MODEL_IGNORE:
-        send_telegram_alert(build_telegram_message(item['company'], item['exchange'], item['scrip'], item['isin'], market_data, audit, item['all_links']))
-
-    log_announcements_batch([(att_id, item['company'], item['headline'], "IGNORE") for att_id in item['all_ids']])
-
-def run_staggered_sieve2_workers(hits, num_workers=4):
-    if not hits: return
+def run_staggered_sieve60_workers(candidates, master_results):
+    """
+    SIEVE 60: The heavy-lifters (Claude and Gemini Pro).
+    Uses a priority queue to hand off filings between models.
+    """
+    if not candidates: return
     counter = itertools.count()
     claude_queue, gemini_queue = queue.PriorityQueue(), queue.PriorityQueue()
-    total_items = len(hits)
-    completed_lock = threading.Lock()
-    completed_count = 0
     stop_event = threading.Event()
+    total_items, completed_count = len(candidates), 0
 
-    for idx, hit in enumerate(hits):
-        task_payload = {'item': hit, 'stage': 1, 'evals': {}}
-        if idx % 2 == 0: claude_queue.put((20, next(counter), task_payload))
-        else: gemini_queue.put((20, next(counter), task_payload))
+    # [ROUTING] Assign half the filings to Claude first, and half to Gemini first.
+    for idx, hit in enumerate(candidates):
+        if idx % 2 == 0: claude_queue.put((20, next(counter), {'item': hit, 'stage': 1}))
+        else: gemini_queue.put((20, next(counter), {'item': hit, 'stage': 1}))
 
-    def claude_worker(worker_id):
+    def extract_scores(text):
+        c_m = re.search(r'Catalyst Score.*?(\b10|[1-9])\b', text, re.IGNORECASE)
+        q_m = re.search(r'Company Quality Score.*?(\b10|[1-9])\b', text, re.IGNORECASE)
+        return int(c_m.group(1)) if c_m else 1, int(q_m.group(1)) if q_m else 5
+
+    def worker_logic(queue_in, queue_out, model_name, client_func):
         nonlocal completed_count
         while not stop_event.is_set():
-            try: priority, seq, task = claude_queue.get(timeout=1.0)
+            try: _, _, task = queue_in.get(timeout=1.0)
             except queue.Empty:
-                with completed_lock:
-                    if completed_count >= total_items: break
+                if completed_count >= total_items: break
                 continue
 
-            item, stage, evals = task['item'], task['stage'], task['evals']
-            market_data = task.get('market_data') or fetch_market_metrics(item['scrip'], item['exchange'])
-            forum_data = task.get('forum_data') or fetch_valuepickr_sentiment(item['company'])
+            item, stage = task['item'], task['stage']
+            market_data = item.get('market_data') or fetch_market_metrics(item['scrip'], item['exchange'])
+            forum_data = item.get('forum_data') or fetch_valuepickr_sentiment(item['company'])
+            item.update({'market_data': market_data, 'forum_data': forum_data})
 
-            print(f"\n[Claude Worker-{worker_id} Stage {stage}] Analyzing {item['company']} ({item['exchange']}:{item['scrip']})...")
-            prompt = build_sieve2_prompt(item, market_data, forum_data, item.get('raw_pdf_text', ''), item.get('qwen_summary', ''))
-            claude_output = evaluate_with_claude(prompt)
+            print(f"\n[{model_name.upper()} Stage {stage}] Analyzing {item['company']}...")
+            output = client_func(build_sieve60_prompt(item, market_data, forum_data))
+            cat_score, comp_score = extract_scores(output)
 
-            cat_score, comp_score = extract_score(claude_output, "Catalyst Score:"), extract_score(claude_output, "Company Quality Score:")
-            evals.update({'claude_catalyst_score': cat_score if isinstance(cat_score, int) else 1, 'claude_company_score': comp_score if isinstance(comp_score, int) else 5, 'claude_analysis': claude_output})
-
-            if stage == 1:
-                if evals['claude_catalyst_score'] >= 5:
-                    print(f" -> [Claude Worker-{worker_id}] Score {evals['claude_catalyst_score']}/10 >= 5. Handoff to Gemini (Priority {20 - evals['claude_catalyst_score']}).")
-                    gemini_queue.put((20 - evals['claude_catalyst_score'], next(counter), {'item': item, 'stage': 2, 'evals': evals, 'market_data': market_data, 'forum_data': forum_data}))
-                else:
-                    finalize_single_model_ignore(item, evals, market_data, "claude", item.get('raw_pdf_text', ''))
-                    with completed_lock:
-                        completed_count += 1
-                        if completed_count >= total_items: stop_event.set()
-            elif stage == 2:
-                finalize_dual_evaluation(item, evals, market_data, item.get('raw_pdf_text', ''))
-                with completed_lock:
-                    completed_count += 1
-                    if completed_count >= total_items: stop_event.set()
-            claude_queue.task_done()
-
-    def gemini_worker(worker_id):
-        nonlocal completed_count
-        while not stop_event.is_set():
-            try: priority, seq, task = gemini_queue.get(timeout=1.0)
-            except queue.Empty:
-                with completed_lock:
-                    if completed_count >= total_items: break
-                continue
-
-            item, stage, evals = task['item'], task['stage'], task['evals']
-            market_data = task.get('market_data') or fetch_market_metrics(item['scrip'], item['exchange'])
-            forum_data = task.get('forum_data') or fetch_valuepickr_sentiment(item['company'])
-
-            print(f"\n[Gemini Worker-{worker_id} Stage {stage}] Analyzing {item['company']} ({item['exchange']}:{item['scrip']})...")
-            prompt = build_sieve2_prompt(item, market_data, forum_data, item.get('raw_pdf_text', ''), item.get('qwen_summary', ''))
-            gemini_output = evaluate_with_gemini(prompt)
-
-            cat_score, comp_score = extract_score(gemini_output, "Catalyst Score:"), extract_score(gemini_output, "Company Quality Score:")
-            evals.update({'gemini_catalyst_score': cat_score if isinstance(cat_score, int) else 1, 'gemini_company_score': comp_score if isinstance(comp_score, int) else 5, 'gemini_analysis': gemini_output})
+            item[f'sieve60_{model_name}_score'] = cat_score
+            item[f'sieve60_{model_name}_company'] = comp_score
+            item[f'sieve60_{model_name}_analysis'] = output
 
             if stage == 1:
-                if evals['gemini_catalyst_score'] >= 5:
-                    print(f" -> [Gemini Worker-{worker_id}] Score {evals['gemini_catalyst_score']}/10 >= 5. Handoff to Claude (Priority {20 - evals['gemini_catalyst_score']}).")
-                    claude_queue.put((20 - evals['gemini_catalyst_score'], next(counter), {'item': item, 'stage': 2, 'evals': evals, 'market_data': market_data, 'forum_data': forum_data}))
+                # [DECISION] If the first model scores it >= 5, pass to the second model to get a consensus.
+                if cat_score >= 5:
+                    queue_out.put((20 - cat_score, next(counter), {'item': item, 'stage': 2}))
                 else:
-                    finalize_single_model_ignore(item, evals, market_data, "gemini", item.get('raw_pdf_text', ''))
-                    with completed_lock:
+                    # [STATE UPDATE] First model hated it. Kill it early to save API tokens.
+                    item['terminal_stage'] = 60
+                    item['status'] = "SINGLE_MODEL_IGNORE"
+                    item['final_score'] = cat_score
+                    with master_list_lock:
+                        master_results.append(item)
                         completed_count += 1
-                        if completed_count >= total_items: stop_event.set()
             elif stage == 2:
-                finalize_dual_evaluation(item, evals, market_data, item.get('raw_pdf_text', ''))
-                with completed_lock:
-                    completed_count += 1
-                    if completed_count >= total_items: stop_event.set()
-            gemini_queue.task_done()
+                # [DECISION] Both models have scored it. Calculate the consensus average.
+                c_cat, g_cat = item.get('sieve60_claude_score', 1), item.get('sieve60_gemini_score', 1)
+                is_divergent = (abs(c_cat - g_cat) >= 4 or (c_cat >= 7 and g_cat <= 4) or (g_cat >= 7 and c_cat <= 4))
+                if is_divergent: status = "MODEL_DIVERGENCE"
+                elif c_cat >= 7 and g_cat >= 7: status = "CONSENSUS_HIT"
+                elif c_cat <= 4 and g_cat <= 4: status = "CONSENSUS_IGNORE"
+                else: status = "NEUTRAL_MIX"
 
+                final_score = round((c_cat + g_cat) / 2)
+                item['terminal_stage'] = 60
+                item['status'] = status
+                item['final_score'] = final_score
+                item['high_conviction'] = (final_score >= 8 and market_data['vol_multiple'] >= 2.0 and market_data['above_50dma'])
+
+                with master_list_lock:
+                    master_results.append(item)
+                    completed_count += 1
+            queue_in.task_done()
+
+    def claude_func(prompt):
+        throttle_api()
+        res = claude_client.messages.create(model=TIER2_CLAUDE_MODEL, max_tokens=500, messages=[{"role": "user", "content": prompt}])
+        return "\n".join([b.text for b in res.content if getattr(b, "type", None) == "text"]).strip()
+
+    def gemini_func(prompt):
+        throttle_api()
+        return gemini_client.models.generate_content(model=TIER2_GEMINI_MODEL, contents=prompt).text.strip()
+
+    # Start 8 parallel workers (4 Claude, 4 Gemini)
     threads = []
-    for i in range(num_workers):
-        t_c, t_g = threading.Thread(target=claude_worker, args=(i + 1,), daemon=True), threading.Thread(target=gemini_worker, args=(i + 1,), daemon=True)
+    for _ in range(4):
+        t_c = threading.Thread(target=worker_logic, args=(claude_queue, gemini_queue, "claude", claude_func))
+        t_g = threading.Thread(target=worker_logic, args=(gemini_queue, claude_queue, "gemini", gemini_func))
         threads.extend([t_c, t_g])
         t_c.start(); t_g.start()
     for t in threads: t.join()
 
-def send_scan_digest(total_ingested, total_new, hits, rejections, duration_seconds):
-    mode_text = "🔄 *Manual Refresh*" if IGNORE_CACHE else "⏰ *Scheduled GitHub Action Scan*"
-    sast_count = sum(1 for r in rejections if any(k in r.get('rejection_reason', '').lower() for k in ['sast', 'pit', 'insider', 'transfer']))
-    admin_count = sum(1 for r in rejections if any(k in r.get('rejection_reason', '').lower() for k in ['certificate', 'meeting', 'governance', 'window', 'newspaper']))
-    other_count = len(rejections) - (sast_count + admin_count)
 
-    hit_lines = ""
-    if hits:
-        hit_lines = "\n\n🎯 <b>High-Materiality Hits Passed to Sieve 2:</b>\n" + "\n".join([f"• <b>{h['company']}</b> (<code>{h['exchange']}:{h['scrip']}</code>) - Score: {h.get('qwen_pre_score', 'N/A')}/10" for h in hits])
+# ---------------------------------------------------------------------------
+# 5. MASTER DISPATCHER (GATEKEEPER)
+# ---------------------------------------------------------------------------
+def build_html_telegram_message(item):
+    """Constructs the heavily formatted Telegram message based on which stage the document died at."""
+    stage, status = item.get('terminal_stage'), item.get('status', 'N/A')
+    market_data = item.get('market_data', fetch_market_metrics(item['scrip'], item['exchange']))
 
-    send_telegram_alert(
-        f"📊 <b>EXCHANGE SCAN COMPLETE (GitHub Runner)</b>\n• <b>Mode:</b> {mode_text}\n• <b>Total Ingested:</b> {total_ingested} filings\n"
-        f"• <b>New Entities Screened:</b> {total_new}\n• <b>Passed Sieve 1.5:</b> {len(hits)} out of {total_new} ({round((len(hits) / max(total_new, 1)) * 100, 1)}%)\n"
-        f"• <b>Execution Latency:</b> {round(duration_seconds, 1)}s\n{hit_lines}\n\n🚫 <b>Noise Filter Breakdown:</b> ({len(rejections)})\n"
-        f"• SAST / PIT / Insider Transfers: {sast_count}\n• Share Certificates / Board Meetings: {admin_count}\n• Routine Disclosures: {max(0, other_count)}"
-    )
+    # Set the headline banner based on where it stopped
+    if stage == 20: banner = "🗑️ <b>FILTERED: SIEVE 20 REJECT</b>"
+    elif stage == 40: banner = "🚫 <b>FILTERED: SIEVE 40 REJECT</b>"
+    elif status == "SINGLE_MODEL_IGNORE": banner = "🚫 <b>FILTERED: SIEVE 60 LOW CONVICTION</b>"
+    elif status == "MODEL_DIVERGENCE": banner = "⚠️ <b>MODEL DIVERGENCE DETECTED</b>"
+    elif item.get('high_conviction'): banner = "🚨 <b>HIGH CONVICTION CATALYST CONCURRENCE</b>"
+    else: banner = "📢 <b>CORPORATE ACTION RE-RATING CATALYST</b>"
+
+    price_str = f"₹{market_data.get('price', 0.0)}" if market_data.get('price', 0.0) > 0 else "₹0.0 (Feed Sync)"
+
+    msg = (f"{banner}\n<b>Company:</b> {item['company']}\n"
+           f"<b>{item['exchange']}:</b> <code>{item['scrip']}</code> | <b>ISIN:</b> <code>{item.get('isin', 'N/A')}</code>\n"
+           f"<b>Price:</b> {price_str} | <b>20D Vol:</b> {market_data.get('vol_multiple', 1.0)}x | <b>52W High:</b> {market_data.get('dist_52w_high', 0.0)}%\n"
+           f"<b>Est. MktCap:</b> ₹{market_data.get('market_cap_cr', 0)} Cr\n")
+
+    if stage == 60:
+        c_cat, g_cat = item.get('sieve60_claude_score'), item.get('sieve60_gemini_score')
+        cat_scores = []
+        if c_cat is not None: cat_scores.append(f"Claude: {c_cat}/10")
+        if g_cat is not None: cat_scores.append(f"Gemini: {g_cat}/10")
+        cat_line = " | ".join(cat_scores) if cat_scores else f"Score: {item.get('final_score', 'N/A')}/10"
+        msg += f"<b>Consensus Status:</b> <code>{status}</code>\n\n🎯 <b>Catalyst Score:</b> {cat_line}\n"
+
+    # Cascading Trail: Always append the history of what prior sieves thought
+    if item.get('sieve20_reason'):
+        msg += f"\n🔍 <b>Sieve 20 Rationale:</b>\n{item['sieve20_reason']}\n"
+    if stage >= 40 and item.get('sieve40_summary'):
+        msg += f"\n🤖 <b>Sieve 40 Qwen Pre-Score ({item.get('sieve40_score', 'N/A')}/10):</b>\n{item['sieve40_summary'][:600]}...\n"
+    if stage == 60:
+        if item.get('sieve60_claude_analysis'): msg += f"\n🧠 <b>Claude (Sieve 60):</b>\n{item['sieve60_claude_analysis']}\n"
+        if item.get('sieve60_gemini_analysis'): msg += f"\n🤖 <b>Gemini (Sieve 60):</b>\n{item['sieve60_gemini_analysis']}\n"
+
+    # HTML Links
+    links = " | ".join([f'<a href="{url}">PDF {i+1}</a>' for i, url in enumerate(item.get('all_links', []))])
+    screener = f"https://www.screener.in/company/{item['scrip']}/"
+    tv = f"https://in.tradingview.com/chart/?symbol={'NSE' if item['exchange'] == 'NSE' else 'BSE'}:{item['scrip']}"
+    msg += f"\n🔗 <b>Quick Links:</b> <a href=\"{screener}\">Screener.in</a> | <a href=\"{tv}\">TradingView</a> | {links}"
+    return msg
+
+def dispatch_deferred_alerts(pipeline_results):
+    """
+    [DECISION: VERBOSITY ROUTER]
+    Loops through every single filing processed today and decides whether to alert you
+    based on the VERBOSITY_LEVEL constant.
+    """
+    print(f"\n=======================================================")
+    print(f"📡 DISPATCHING DEFERRED ALERTS (VERBOSITY: {VERBOSITY_LEVEL})")
+    print(f"=======================================================\n")
+
+    for item in pipeline_results:
+        stage = item.get('terminal_stage', 0)
+        status = item.get('status', '')
+        final_score = item.get('final_score', 0)
+        should_send = False
+
+        if VERBOSITY_LEVEL <= 20:
+            should_send = True  # Send absolutely everything
+        elif VERBOSITY_LEVEL <= 40 and stage >= 40:
+            should_send = True  # Ignore Sieve 20 rejects
+        elif VERBOSITY_LEVEL <= 60 and stage >= 60:
+            should_send = True  # Ignore Sieve 20 and 40 rejects
+        elif VERBOSITY_LEVEL >= 1000:
+            # Production max: Only send if it fully completed Sieve 60 AND scored 6 or higher
+            if stage == 60 and status not in ["SINGLE_MODEL_IGNORE", "REJECTED_SIEVE20", "REJECTED_SIEVE40"] and final_score >= 6:
+                should_send = True
+
+        if should_send and TELEGRAM_BOT_TOKEN:
+            try:
+                msg = build_html_telegram_message(item)
+                requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=8)
+                time.sleep(0.5) # Anti-spam buffer
+            except Exception as e: print(f"Telegram dispatch failed for {item['company']}: {e}")
+
+        # Ledger & DB Caching for all processed items
+        if stage >= 60: log_permanent_ledger(item, item.get('market_data', {}))
+        decision = "HIT" if stage == 60 and final_score >= 6 else "IGNORE"
+        log_announcements_batch([(att_id, item['company'], item['headline'], decision) for att_id in item['all_ids']])
 
 
 # ---------------------------------------------------------------------------
-# 9. YOUTUBE TV INTERVIEWS & DUAL INGESTION
+# 6. RAW DATA INGESTION METHODS
 # ---------------------------------------------------------------------------
 def process_youtube_interviews(channel_id=DEFAULT_YOUTUBE_CHANNEL_ID):
+    """Downloads recent TV interviews and asks Gemini to look for capex/guidance mentions."""
     if not gemini_client: return
-    feed = feedparser.parse(YOUTUBE_RSS_URL.format(channel_id=channel_id))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=15)
-    for entry in feed.entries[:4]:
-        if datetime(*entry.published_parsed[:6], tzinfo=timezone.utc) < cutoff: continue
-        try:
+    try:
+        feed = feedparser.parse(YOUTUBE_RSS_URL.format(channel_id=channel_id))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=15)
+        for entry in feed.entries[:4]:
+            if datetime(*entry.published_parsed[:6], tzinfo=timezone.utc) < cutoff: continue
+
             transcript = YouTubeTranscriptApi.get_transcript(entry.yt_videoid)
             text = " ".join([t['text'] for t in transcript[:120]])
-            res = gemini_client.models.generate_content(model=TIER1_MODEL, contents=f"Does this interview discuss capex expansion, guidance revisions, or major order pipeline?\nTitle: {entry.title}\nTranscript Preview: {text}\nReturn strictly the COMPANY_NAME if YES, or return IGNORE if routine.")
-            if "IGNORE" not in res.text: send_telegram_alert(f"📺 <b>MANAGEMENT INTERVIEW CATALYST</b>\n\n<b>Title:</b> {entry.title}\n🔗 <a href=\"{entry.link}\">Watch Interview</a>")
-        except Exception: continue
+
+            prompt = f"Does this interview discuss capex expansion, guidance revisions, or major order pipeline?\nTitle: {entry.title}\nTranscript Preview: {text}\nReturn strictly the COMPANY_NAME if YES, or return IGNORE if routine."
+            res = gemini_client.models.generate_content(model=TIER1_MODEL, contents=prompt)
+
+            if "IGNORE" not in res.text:
+                print(f"[YouTube Hit] {entry.title}")
+                if VERBOSITY_LEVEL <= 1000:  # Always send TV hits
+                    requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": f"📺 <b>MANAGEMENT INTERVIEW CATALYST</b>\n\n<b>Title:</b> {entry.title}\n🔗 <a href=\"{entry.link}\">Watch Interview</a>", "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=8)
+    except Exception as e:
+        print(f"[YouTube Scanner Error] {e}")
 
 def fetch_live_nse_filings():
+    """Hits the NSE API using a Session to preserve cookies and bypass basic bot protection."""
     session = requests.Session()
     session.headers.update(NSE_HEADERS)
     standardized_filings = []
     try:
+        # Step 1: Hit homepage to acquire required cookies
         session.get(NSE_BASE_URL, timeout=10)
+        # Step 2: Hit actual API endpoint
         resp = session.get(NSE_API_URL, timeout=10)
+
         if resp.status_code == 200:
             data = resp.json() if isinstance(resp.json(), list) else resp.json().get('data', [])
             for item in data:
                 attachment = item.get('attchmntFile') or item.get('attchmntText') or str(item.get('seq_id', ''))
                 if not attachment: continue
+
                 pdf_link = item.get('attchmntText', '')
-                if pdf_link and not pdf_link.startswith('http'): pdf_link = f"{NSE_BASE_URL}{pdf_link}"
-                standardized_filings.append({'id': str(attachment), 'company': item.get('sm_name', item.get('symbol', 'Unknown NSE Company')), 'scrip': item.get('symbol', ''), 'headline': item.get('subject', item.get('desc', '')), 'isin': 'N/A', 'link': pdf_link, 'exchange': 'NSE'})
+                if pdf_link and not pdf_link.startswith('http'):
+                    pdf_link = f"{NSE_BASE_URL}{pdf_link}"
+
+                standardized_filings.append({
+                    'id': str(attachment),
+                    'company': item.get('sm_name', item.get('symbol', 'Unknown NSE Company')),
+                    'scrip': item.get('symbol', ''),
+                    'headline': item.get('subject', item.get('desc', '')),
+                    'isin': 'N/A',
+                    'link': pdf_link,
+                    'exchange': 'NSE'
+                })
     except Exception as e: print(f"[NSE Ingestion Notice] {e}")
     return standardized_filings
 
 def fetch_live_bse_filings(max_pages=100):
+    """Paginates backward through the live BSE announcement feed."""
     standardized_filings = []
     page = 1
     while page <= max_pages:
@@ -785,102 +639,83 @@ def fetch_live_bse_filings(max_pages=100):
             resp = requests.get(BSE_API_URL.format(page=page), headers=BSE_HEADERS, timeout=10)
             if resp.status_code == 200:
                 table = resp.json().get('Table', [])
-                if not table: break
+                if not table: break  # Reached the end of available filings
+
                 for item in table:
                     if not item.get('ATTACHMENTNAME'): continue
                     raw_isin = item.get('ISIN_CODE', '').strip()
-                    standardized_filings.append({'id': item['ATTACHMENTNAME'], 'company': item.get('SLONGNAME', 'Unknown Company'), 'scrip': str(item.get('SCRIP_CD', '')).strip(), 'headline': item.get('NEWSSUB', ''), 'isin': raw_isin if raw_isin else 'N/A', 'link': BSE_PDF_BASE_URL.format(attachment=item['ATTACHMENTNAME']), 'exchange': 'BSE'})
-                page += 1; time.sleep(0.2)
-            else: break
+                    standardized_filings.append({
+                        'id': item['ATTACHMENTNAME'],
+                        'company': item.get('SLONGNAME', 'Unknown Company'),
+                        'scrip': str(item.get('SCRIP_CD', '')).strip(),
+                        'headline': item.get('NEWSSUB', ''),
+                        'isin': raw_isin if raw_isin else 'N/A',
+                        'link': BSE_PDF_BASE_URL.format(attachment=item['ATTACHMENTNAME']),
+                        'exchange': 'BSE'
+                    })
+                page += 1
+                time.sleep(0.2) # Politeness delay
+            else:
+                break
         except Exception as e:
             print(f"[BSE Ingestion Notice on Page {page}] {e}"); break
     return standardized_filings
 
 
 # ---------------------------------------------------------------------------
-# 10. MAIN PIPELINE ORCHESTRATOR
+# 7. MAIN PIPELINE ORCHESTRATOR
 # ---------------------------------------------------------------------------
 def main():
     start_time = time.time()
-    print(f"[{datetime.now()}] Initializing Market Intelligence Pipeline (GitHub Runner)...")
+    print(f"[{datetime.now()}] Initializing Pipeline (Verbosity Threshold: {VERBOSITY_LEVEL})...")
 
-    unified_filings = fetch_live_bse_filings(max_pages=args.max_pages) + fetch_live_nse_filings()
-    unprocessed_filings = filter_unprocessed_announcements(unified_filings)
-
-    if not unprocessed_filings:
-        print("No new filings found in this scan cycle. Exiting.")
+    unified = fetch_live_bse_filings(max_pages=args.max_pages) + fetch_live_nse_filings()
+    unprocessed = filter_unprocessed_announcements(unified)
+    if not unprocessed:
+        print("No new filings found in this scan cycle.")
         return
 
-    grouped_filings = group_filings_by_company(unprocessed_filings)
-    print(f"Consolidated into {len(grouped_filings)} distinct company events.")
+    grouped = group_filings_by_company(unprocessed)
+    print(f"Consolidated into {len(grouped)} distinct company events.")
 
-    # Tier 1 Sieve
-    hits, rejections = run_tier1_batch_sieve(grouped_filings)
+    pipeline_results = []
 
-    if rejections:
-        log_announcements_batch([(att_id, r['company'], r['headline'], "IGNORE") for r in rejections for att_id in r['all_ids']])
+    # --- SIEVE 20 ---
+    print(f"\n[SIEVE 20] Broad-net noise filtering...")
+    sieve20_hits = run_sieve20_batch(grouped, pipeline_results)
 
-    if hits and PUBLISH_WHEN_SIEVE_PASSED <= 1.0:
-        for h in hits:
-            mkt = fetch_market_metrics(h['scrip'], h['exchange'])
-            alert_msg = build_telegram_message(
-                h['company'], h['exchange'], h['scrip'], h['isin'], mkt,
-                {
-                    'consensus_status': 'SIEVE_1_PASS', 'final_score': 'N/A', 'high_conviction': False,
-                    'claude_catalyst_score': None, 'gemini_catalyst_score': None,
-                    'sieve1_reason': h.get('catalyst_reason', ''), 'claude_analysis': h.get('catalyst_reason', ''), 'gemini_analysis': ''
-                },
-                h['all_links']
-            )
-            send_telegram_alert(alert_msg)
-
-    # Tier 1.5 Sieve
-    sieve_1_5_passed = []
-    if hits:
-        print(f"\n=======================================================")
-        print(f"🤖 [SIEVE 1.5] Executing Dynamic Extraction & Qwen Pre-Scoring on {len(hits)} hits...")
-        print(f"=======================================================\n")
-
-        for h in hits:
-            primary_link = h['all_links'][0] if h.get('all_links') else h.get('link', '')
-            raw_pdf_text = extract_text_from_pdf_url(primary_link, h['headline'])
-            qwen_summary, pre_score = sieve_1_5_local_qwen_extraction(raw_pdf_text, h['headline'])
-
-            h['raw_pdf_text'] = raw_pdf_text
-            h['qwen_summary'] = qwen_summary
-            h['qwen_pre_score'] = pre_score
-
-            print(f" -> [{h['company']}] Qwen Pre-Score: {pre_score}/10 (Threshold: >= {SIEVE_1_5_MIN_SCORE})")
-
-            if pre_score >= SIEVE_1_5_MIN_SCORE:
-                sieve_1_5_passed.append(h)
-                if PUBLISH_WHEN_SIEVE_PASSED <= 1.5:
-                    mkt = fetch_market_metrics(h['scrip'], h['exchange'])
-                    alert_msg = build_telegram_message(
-                        h['company'], h['exchange'], h['scrip'], h['isin'], mkt,
-                        {
-                            'consensus_status': 'SIEVE_1_5_PASS', 'final_score': pre_score, 'high_conviction': False,
-                            'claude_catalyst_score': None, 'gemini_catalyst_score': None,
-                            'sieve1_reason': h.get('catalyst_reason', ''),
-                            'sieve15_summary': qwen_summary,
-                            'claude_analysis': qwen_summary, 'gemini_analysis': ''
-                        },
-                        h['all_links']
-                    )
-                    send_telegram_alert(alert_msg)
+    # --- SIEVE 40 ---
+    sieve40_hits = []
+    if sieve20_hits:
+        print(f"\n[SIEVE 40] Executing Dynamic Extraction & Qwen Pre-Scoring on {len(sieve20_hits)} hits...")
+        for item in sieve20_hits:
+            item = run_sieve40_extraction(item)
+            score = item.get('sieve40_score', 5)
+            print(f" -> [{item['company']}] Sieve 40 Score: {score}/10")
+            if score >= SIEVE_40_MIN_SCORE:
+                sieve40_hits.append(item)
             else:
-                log_announcements_batch([(att_id, h['company'], h['headline'], "IGNORE") for att_id in h['all_ids']])
-                print(f"    🚫 Filtered out locally by Sieve 1.5 (Score {pre_score} < {SIEVE_1_5_MIN_SCORE}).")
+                item['terminal_stage'] = 40
+                item['status'] = "REJECTED_SIEVE40"
+                pipeline_results.append(item)
 
-    # Tier 2 Sieve
-    if sieve_1_5_passed:
-        candidates = sieve_1_5_passed[:args.max_sieve2] if args.max_sieve2 > 0 else sieve_1_5_passed
-        run_staggered_sieve2_workers(candidates, num_workers=4)
+    # --- SIEVE 60 ---
+    if sieve40_hits:
+        print(f"\n[SIEVE 60] Handing off to Claude & Gemini for deep reasoning...")
+        candidates = sieve40_hits[:args.max_sieve60] if args.max_sieve60 > 0 else sieve40_hits
+        run_staggered_sieve60_workers(candidates, pipeline_results)
 
+    # --- DISPATCH ---
+    dispatch_deferred_alerts(pipeline_results)
+
+    # Global Telegram Digest summarizing the run
     duration = time.time() - start_time
-    send_scan_digest(len(unified_filings), len(grouped_filings), sieve_1_5_passed, rejections, duration)
+    digest = f"📊 <b>EXCHANGE SCAN COMPLETE</b>\n• <b>Verbosity:</b> {VERBOSITY_LEVEL}\n• <b>Total Screened:</b> {len(grouped)}\n• <b>Passed Sieve 40:</b> {len(sieve40_hits)}\n• <b>Latency:</b> {round(duration, 1)}s"
+    if TELEGRAM_BOT_TOKEN:
+        requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json={"chat_id": TELEGRAM_CHAT_ID, "text": digest, "parse_mode": "HTML"}, timeout=8)
+
     process_youtube_interviews()
-    print(f"[{datetime.now()}] Pipeline execution finished in {round(duration, 1)}s.")
+    print(f"[{datetime.now()}] Execution finished in {round(duration, 1)}s.")
 
 if __name__ == "__main__":
     main()
