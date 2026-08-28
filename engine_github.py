@@ -1,14 +1,12 @@
 """
 Market Intelligence & Corporate Announcement Screening Engine (GitHub Actions Edition)
 =======================================================================================
-Architecture & New Features:
+Architecture & Features:
 - Dynamic Payload Router: Intelligently switches between pypdf (10k chars) and pdfplumber (50k chars) based on headline context.
-- Full-PDF Passthrough: Qwen 2.5 7B acts as a fast gatekeeper (4.5k chars), while Sieve 2 gets the full 50k-char raw text.
+- Full-PDF Passthrough: Qwen 2.5 7B acts as a fast gatekeeper (4.5k chars), while Sieve 2 gets the full raw text.
 - Peak Deluge Throttling: Thread-safe token bucket pacing prevents API 429 errors during earnings season.
-- Direct Alpha Quick-Links: Embedded Screener & TradingView URLs.
-- Type-Safe Quant Ledger: NumPy bool conversion prevents Supabase crash.
-
-Note: Ensure `pdfplumber` is added to your requirements.txt
+- Cascading Telegram Verbosity: Controlled via PUBLISH_WHEN_SIEVE_PASSED (1.0 = All, 1.5 = Sieve 1.5 + Sieve 2, 2.0 = Sieve 2 only, 100 = Max / Score > 5 only).
+- HTML Telegram Dispatcher: Fully HTML-escaped rich text with clickable Screener, TradingView, and PDF links.
 """
 
 import os
@@ -77,7 +75,11 @@ NSE_HEADERS = {
 DEFAULT_CHUNK_SIZE = 50
 DEFAULT_YOUTUBE_CHANNEL_ID = "UCb5hMTAFjG5j79V6nL3_YCQ"
 
-# Verbosity & Sieve Logic
+# Verbosity & Sieve Logic Thresholds
+# 1.0 = Pings for Sieve 1, Sieve 1.5, and Sieve 2
+# 1.5 = Pings for Sieve 1.5 + Sieve 2
+# 2.0 = Pings for Sieve 2 only
+# 100 = Max (Strict Sieve 2 passed results with score > 5 only)
 PUBLISH_WHEN_SIEVE_PASSED = float(os.getenv("PUBLISH_WHEN_SIEVE_PASSED", "1.5"))
 DEFAULT_MAX_SIEVE2 = int(os.getenv("MAX_SIEVE2_ITEMS", "0"))
 SIEVE_1_5_MIN_SCORE = int(os.getenv("SIEVE_1_5_MIN_SCORE", "5"))
@@ -111,10 +113,9 @@ claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else N
 # Throttling Locks
 api_lock = threading.Lock()
 last_api_call = 0.0
-MIN_API_DELAY = 1.5  # Prevents 429 Too Many Requests across threaded workers
+MIN_API_DELAY = 1.5
 
 def throttle_api():
-    """Implements thread-safe pacing for peak earnings deluge spikes."""
     global last_api_call
     with api_lock:
         now = time.time()
@@ -279,11 +280,6 @@ def sanitize_filing_text(text):
     return text.strip()
 
 def extract_text_from_pdf_url(pdf_url, headline):
-    """
-    Dynamic Router:
-    - Standard Catalysts: pypdf (4 pages, 10k chars) -> Lightning fast.
-    - Financial Tables: pdfplumber (15 pages, 50k chars) -> High fidelity tabular rendering.
-    """
     if not pdf_url or not pdf_url.startswith("http"):
         return "No valid PDF URL provided."
 
@@ -303,7 +299,6 @@ def extract_text_from_pdf_url(pdf_url, headline):
                     with pdfplumber.open(pdf_buffer) as pdf:
                         for i, page in enumerate(pdf.pages):
                             if i >= max_pages: break
-                            # layout=True preserves spatial tabular alignment crucial for financial P&L
                             text = page.extract_text(layout=True) or page.extract_text()
                             if text: extracted_pages.append(text)
                     raw_text = "\n".join(extracted_pages)
@@ -395,7 +390,6 @@ def run_tier1_batch_sieve(announcements):
 
 
 def sieve_1_5_local_qwen_extraction(cleaned_pdf_text, headline):
-    """Sieve 1.5 strictly reads the first 4,500 chars to save CPU time on the GitHub runner."""
     if not USE_LOCAL_EXTRACTOR or not cleaned_pdf_text or len(cleaned_pdf_text) < 80:
         return "No local extraction.", 5
 
@@ -496,7 +490,7 @@ def evaluate_with_gemini(prompt):
 
 
 # ---------------------------------------------------------------------------
-# 7. TELEGRAM DISPATCHER (WITH QUICK LINKS)
+# 7. TELEGRAM DISPATCHER (HTML MODE + CASCADING RATIONALE)
 # ---------------------------------------------------------------------------
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -506,7 +500,7 @@ def send_telegram_alert(message):
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
-            "parse_mode": "HTML",  # Switched to HTML to bulletproof links and formatting
+            "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
         requests.post(TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN), json=payload, timeout=8)
@@ -517,18 +511,12 @@ def send_telegram_alert(message):
 def build_telegram_message(company, exchange, scrip_code, isin, market_data, audit, all_links):
     status = audit.get('consensus_status', 'NEUTRAL_MIX')
 
-    if status == "SIEVE_1_PASS":
-        banner = "🔍 <b>INITIAL RADAR: SIEVE 1 (FLASH) PASSED</b>"
-    elif status == "SIEVE_1_5_PASS":
-        banner = "⚡ <b>EARLY RADAR: SIEVE 1.5 (QWEN) PASSED</b>"
-    elif status == "MODEL_DIVERGENCE":
-        banner = "⚠️ <b>MODEL DIVERGENCE DETECTED</b>"
-    elif status == "SINGLE_MODEL_IGNORE":
-        banner = "🚫 <b>FILTERED / LOW CONVICTION (EARLY EXIT)</b>"
-    elif audit.get('high_conviction'):
-        banner = "🚨 <b>HIGH CONVICTION CATALYST CONCURRENCE</b>"
-    else:
-        banner = "📢 <b>CORPORATE ACTION RE-RATING CATALYST</b>"
+    if status == "SIEVE_1_PASS": banner = "🔍 <b>INITIAL RADAR: SIEVE 1 (FLASH) PASSED</b>"
+    elif status == "SIEVE_1_5_PASS": banner = "⚡ <b>EARLY RADAR: SIEVE 1.5 (QWEN) PASSED</b>"
+    elif status == "MODEL_DIVERGENCE": banner = "⚠️ <b>MODEL DIVERGENCE DETECTED</b>"
+    elif status == "SINGLE_MODEL_IGNORE": banner = "🚫 <b>FILTERED / LOW CONVICTION (EARLY EXIT)</b>"
+    elif audit.get('high_conviction'): banner = "🚨 <b>HIGH CONVICTION CATALYST CONCURRENCE</b>"
+    else: banner = "📢 <b>CORPORATE ACTION RE-RATING CATALYST</b>"
 
     price_str = f"₹{market_data['price']}" if market_data['price'] > 0 else "₹0.0 (Data Feed Sync)"
 
@@ -537,8 +525,7 @@ def build_telegram_message(company, exchange, scrip_code, isin, market_data, aud
     if c_cat is not None: cat_scores.append(f"Claude: {c_cat}/10")
     if g_cat is not None: cat_scores.append(f"Gemini: {g_cat}/10")
     fs = audit.get('final_score', 'N/A')
-    cat_line = " | ".join(cat_scores) if cat_scores else (
-        f"Score: {fs}/10" if isinstance(fs, (int, float)) else "Score: N/A")
+    cat_line = " | ".join(cat_scores) if cat_scores else (f"Score: {fs}/10" if isinstance(fs, (int, float)) else "Score: N/A")
 
     c_comp, g_comp = audit.get('claude_company_score'), audit.get('gemini_company_score')
     comp_scores = []
@@ -561,18 +548,15 @@ def build_telegram_message(company, exchange, scrip_code, isin, market_data, aud
     if status not in ["SIEVE_1_PASS", "SIEVE_1_5_PASS"]:
         msg += f"<b>Consensus Status:</b> <code>{status}</code>\n\n🎯 <b>Catalyst Score:</b> {cat_line}\n🏢 <b>Company Quality:</b> {comp_line}\n"
 
-    # --- CASCADING REASONING TRAIL ---
-    # 1. Sieve 1 Reason
+    # --- CASCADING RATIONALE TRAIL ---
     s1_reason = audit.get('sieve1_reason')
     if s1_reason:
         msg += f"\n🔍 <b>Sieve 1 (Flash Lite) Intake Rationale:</b>\n{s1_reason}\n"
 
-    # 2. Sieve 1.5 Qwen Summary
     s15_summary = audit.get('sieve15_summary')
     if s15_summary and status != "SIEVE_1_PASS":
         msg += f"\n🤖 <b>Sieve 1.5 (Qwen 7B) Extracted Summary & Pre-Score ({audit.get('qwen_pre_score', 'N/A')}/10):</b>\n{s15_summary[:600]}...\n"
 
-    # 3. Sieve 2 Deep Dive Analysis
     if status == "SIEVE_1_PASS":
         msg += f"\n🔍 <i>Catalyst Reason:</i>\n{audit.get('claude_analysis', 'N/A')}\n"
     elif status == "SIEVE_1_5_PASS":
@@ -586,6 +570,7 @@ def build_telegram_message(company, exchange, scrip_code, isin, market_data, aud
     pdf_links_str = " | ".join([f'<a href="{link}">PDF {i + 1}</a>' for i, link in enumerate(all_links)])
     msg += f"\n🔗 <b>Quick Links:</b> <a href=\"{screener_link}\">Screener.in</a> | <a href=\"{tv_link}\">TradingView</a> | {pdf_links_str}"
     return msg
+
 
 # ---------------------------------------------------------------------------
 # 8. STAGGERED PRIORITY WORKERS & FINALIZATION
@@ -605,32 +590,37 @@ def finalize_dual_evaluation(item, evals, market_data, raw_pdf_text):
 
     audit = {
         'consensus_status': consensus_status, 'final_score': final_score, 'high_conviction': is_high_conviction,
-        'claude_catalyst_score': c_cat, 'gemini_catalyst_score': g_cat, 'claude_company_score': c_comp,
-        'gemini_company_score': g_comp,
+        'claude_catalyst_score': c_cat, 'gemini_catalyst_score': g_cat, 'claude_company_score': c_comp, 'gemini_company_score': g_comp,
         'claude_analysis': evals.get('claude_analysis', ''), 'gemini_analysis': evals.get('gemini_analysis', ''),
         'sieve1_reason': item.get('catalyst_reason'),
         'sieve15_summary': item.get('qwen_summary'),
         'qwen_pre_score': item.get('qwen_pre_score')
     }
 
-    if PUBLISH_WHEN_SIEVE_PASSED <= 2.0 and final_score >= 6:
+    # Publishing threshold check:
+    # PUBLISH_WHEN_SIEVE_PASSED <= 2.0: Publishes Sieve 2 results
+    # PUBLISH_WHEN_SIEVE_PASSED >= 100: Publishes Sieve 2 passed results with score > 5 (i.e. >= 6) only
+    should_publish = False
+    if PUBLISH_WHEN_SIEVE_PASSED <= 2.0:
+        should_publish = True
+    elif PUBLISH_WHEN_SIEVE_PASSED >= 100:
+        if final_score >= 6:
+            should_publish = True
+
+    if should_publish:
         send_telegram_alert(build_telegram_message(item['company'], item['exchange'], item['scrip'], item['isin'], market_data, audit, item['all_links']))
 
     log_permanent_ledger(item, market_data, evals, audit, raw_pdf_text)
     log_announcements_batch([(att_id, item['company'], item['headline'], "HIT") for att_id in item['all_ids']])
 
-
 def finalize_single_model_ignore(item, evals, market_data, source_model, raw_pdf_text):
     score = evals.get(f'{source_model.lower()}_catalyst_score', 1)
-    print(
-        f" -> [{source_model.upper()} Gatekeeper] Score {score}/10 < 5. Terminating Sieve 2 early for {item['company']}.")
+    print(f" -> [{source_model.upper()} Gatekeeper] Score {score}/10 < 5. Terminating Sieve 2 early for {item['company']}.")
 
     audit = {
         'consensus_status': "SINGLE_MODEL_IGNORE", 'final_score': score, 'high_conviction': False,
-        'claude_catalyst_score': evals.get('claude_catalyst_score'),
-        'gemini_catalyst_score': evals.get('gemini_catalyst_score'),
-        'claude_company_score': evals.get('claude_company_score', 5),
-        'gemini_company_score': evals.get('gemini_company_score', 5),
+        'claude_catalyst_score': evals.get('claude_catalyst_score'), 'gemini_catalyst_score': evals.get('gemini_catalyst_score'),
+        'claude_company_score': evals.get('claude_company_score', 5), 'gemini_company_score': evals.get('gemini_company_score', 5),
         'claude_analysis': evals.get('claude_analysis', ''), 'gemini_analysis': evals.get('gemini_analysis', ''),
         'sieve1_reason': item.get('catalyst_reason'),
         'sieve15_summary': item.get('qwen_summary'),
@@ -638,9 +628,7 @@ def finalize_single_model_ignore(item, evals, market_data, source_model, raw_pdf
     }
 
     if ALERT_ON_SINGLE_MODEL_IGNORE:
-        send_telegram_alert(
-            build_telegram_message(item['company'], item['exchange'], item['scrip'], item['isin'], market_data, audit,
-                                   item['all_links']))
+        send_telegram_alert(build_telegram_message(item['company'], item['exchange'], item['scrip'], item['isin'], market_data, audit, item['all_links']))
 
     log_announcements_batch([(att_id, item['company'], item['headline'], "IGNORE") for att_id in item['all_ids']])
 
@@ -745,12 +733,12 @@ def send_scan_digest(total_ingested, total_new, hits, rejections, duration_secon
 
     hit_lines = ""
     if hits:
-        hit_lines = "\n\n🎯 *High-Materiality Hits Passed to Sieve 2:*\n" + "\n".join([f"• *{h['company']}* (`{h['exchange']}:{h['scrip']}`) - Score: {h.get('qwen_pre_score', 'N/A')}/10" for h in hits])
+        hit_lines = "\n\n🎯 <b>High-Materiality Hits Passed to Sieve 2:</b>\n" + "\n".join([f"• <b>{h['company']}</b> (<code>{h['exchange']}:{h['scrip']}</code>) - Score: {h.get('qwen_pre_score', 'N/A')}/10" for h in hits])
 
     send_telegram_alert(
-        f"📊 *EXCHANGE SCAN COMPLETE (GitHub Runner)*\n• *Mode:* {mode_text}\n• *Total Ingested:* {total_ingested} filings\n"
-        f"• *New Entities Screened:* {total_new}\n• *Passed Sieve 1.5:* {len(hits)} out of {total_new} ({round((len(hits) / max(total_new, 1)) * 100, 1)}%)\n"
-        f"• *Execution Latency:* {round(duration_seconds, 1)}s\n{hit_lines}\n\n🚫 *Noise Filter Breakdown:* ({len(rejections)})\n"
+        f"📊 <b>EXCHANGE SCAN COMPLETE (GitHub Runner)</b>\n• <b>Mode:</b> {mode_text}\n• <b>Total Ingested:</b> {total_ingested} filings\n"
+        f"• <b>New Entities Screened:</b> {total_new}\n• <b>Passed Sieve 1.5:</b> {len(hits)} out of {total_new} ({round((len(hits) / max(total_new, 1)) * 100, 1)}%)\n"
+        f"• <b>Execution Latency:</b> {round(duration_seconds, 1)}s\n{hit_lines}\n\n🚫 <b>Noise Filter Breakdown:</b> ({len(rejections)})\n"
         f"• SAST / PIT / Insider Transfers: {sast_count}\n• Share Certificates / Board Meetings: {admin_count}\n• Routine Disclosures: {max(0, other_count)}"
     )
 
@@ -768,7 +756,7 @@ def process_youtube_interviews(channel_id=DEFAULT_YOUTUBE_CHANNEL_ID):
             transcript = YouTubeTranscriptApi.get_transcript(entry.yt_videoid)
             text = " ".join([t['text'] for t in transcript[:120]])
             res = gemini_client.models.generate_content(model=TIER1_MODEL, contents=f"Does this interview discuss capex expansion, guidance revisions, or major order pipeline?\nTitle: {entry.title}\nTranscript Preview: {text}\nReturn strictly the COMPANY_NAME if YES, or return IGNORE if routine.")
-            if "IGNORE" not in res.text: send_telegram_alert(f"📺 *MANAGEMENT INTERVIEW CATALYST*\n\n**Title:** {entry.title}\n🔗 [Watch Interview]({entry.link})")
+            if "IGNORE" not in res.text: send_telegram_alert(f"📺 <b>MANAGEMENT INTERVIEW CATALYST</b>\n\n<b>Title:</b> {entry.title}\n🔗 <a href=\"{entry.link}\">Watch Interview</a>")
         except Exception: continue
 
 def fetch_live_nse_filings():
@@ -835,10 +823,18 @@ def main():
     if hits and PUBLISH_WHEN_SIEVE_PASSED <= 1.0:
         for h in hits:
             mkt = fetch_market_metrics(h['scrip'], h['exchange'])
-            alert_msg = build_telegram_message(h['company'], h['exchange'], h['scrip'], h['isin'], mkt, {'consensus_status': 'SIEVE_1_PASS', 'final_score': 'N/A', 'high_conviction': False, 'claude_catalyst_score': None, 'gemini_catalyst_score': None, 'claude_analysis': h.get('catalyst_reason', ''), 'gemini_analysis': ''}, h['all_links'])
+            alert_msg = build_telegram_message(
+                h['company'], h['exchange'], h['scrip'], h['isin'], mkt,
+                {
+                    'consensus_status': 'SIEVE_1_PASS', 'final_score': 'N/A', 'high_conviction': False,
+                    'claude_catalyst_score': None, 'gemini_catalyst_score': None,
+                    'sieve1_reason': h.get('catalyst_reason', ''), 'claude_analysis': h.get('catalyst_reason', ''), 'gemini_analysis': ''
+                },
+                h['all_links']
+            )
             send_telegram_alert(alert_msg)
 
-    # Tier 1.5 Sieve (Extracts via Router & Evaluates via Qwen)
+    # Tier 1.5 Sieve
     sieve_1_5_passed = []
     if hits:
         print(f"\n=======================================================")
@@ -860,13 +856,23 @@ def main():
                 sieve_1_5_passed.append(h)
                 if PUBLISH_WHEN_SIEVE_PASSED <= 1.5:
                     mkt = fetch_market_metrics(h['scrip'], h['exchange'])
-                    alert_msg = build_telegram_message(h['company'], h['exchange'], h['scrip'], h['isin'], mkt, {'consensus_status': 'SIEVE_1_5_PASS', 'final_score': pre_score, 'high_conviction': False, 'claude_catalyst_score': None, 'gemini_catalyst_score': None, 'claude_analysis': qwen_summary[:800], 'gemini_analysis': ''}, h['all_links'])
+                    alert_msg = build_telegram_message(
+                        h['company'], h['exchange'], h['scrip'], h['isin'], mkt,
+                        {
+                            'consensus_status': 'SIEVE_1_5_PASS', 'final_score': pre_score, 'high_conviction': False,
+                            'claude_catalyst_score': None, 'gemini_catalyst_score': None,
+                            'sieve1_reason': h.get('catalyst_reason', ''),
+                            'sieve15_summary': qwen_summary,
+                            'claude_analysis': qwen_summary, 'gemini_analysis': ''
+                        },
+                        h['all_links']
+                    )
                     send_telegram_alert(alert_msg)
             else:
                 log_announcements_batch([(att_id, h['company'], h['headline'], "IGNORE") for att_id in h['all_ids']])
                 print(f"    🚫 Filtered out locally by Sieve 1.5 (Score {pre_score} < {SIEVE_1_5_MIN_SCORE}).")
 
-    # Tier 2 Sieve (Full PDF Passthrough)
+    # Tier 2 Sieve
     if sieve_1_5_passed:
         candidates = sieve_1_5_passed[:args.max_sieve2] if args.max_sieve2 > 0 else sieve_1_5_passed
         run_staggered_sieve2_workers(candidates, num_workers=4)
