@@ -53,3 +53,4 @@ jobs:
           OLLAMA_MODEL: "qwen2.5:7b"
         run: |
           python test_github_actions_calibration.py
+          
